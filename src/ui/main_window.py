@@ -24,6 +24,7 @@ from src.services.connectivity_service import get_connectivity_service
 from src.utils.audio_handler import AudioHandler
 from src.utils.cache import TranslationCache
 from src.utils.logger import get_logger, setup_logger, create_log_file
+from src.utils.performance import format_stage_metrics, stage_metrics, summarize_aggregate, take_perf_sample
 from src.config import get_config
 from src.cloud.claude_client import get_claude_client
 
@@ -33,7 +34,7 @@ logger = get_logger(__name__)
 class RecordingWorker(QThread):
     """Worker thread for microphone capture."""
 
-    finished = pyqtSignal()
+    work_finished = pyqtSignal()
     error = pyqtSignal(str)
     audio_ready = pyqtSignal(object)
 
@@ -51,13 +52,13 @@ class RecordingWorker(QThread):
             logger.error(f"Recording error: {e}")
             self.error.emit(f"Recording failed: {str(e)}")
         finally:
-            self.finished.emit()
+            self.work_finished.emit()
 
 
 class StreamingSTTWorker(QThread):
     """Worker thread for near-real-time STT updates while recording."""
 
-    finished = pyqtSignal()
+    work_finished = pyqtSignal()
     error = pyqtSignal(str)
     progress = pyqtSignal(str)
     partial_ready = pyqtSignal(str)
@@ -128,16 +129,226 @@ class StreamingSTTWorker(QThread):
             self.error.emit(f"Error: {str(e)}")
         finally:
             self.audio_handler.stop_recording()
-            self.finished.emit()
+            self.work_finished.emit()
+
+
+class StreamingPipelineWorker(QThread):
+    """Worker thread for streaming STT plus live translation updates."""
+
+    work_finished = pyqtSignal()
+    error = pyqtSignal(str)
+    progress = pyqtSignal(str)
+    partial_update = pyqtSignal(str, str)  # source_text, translated_text
+    final_result_ready = pyqtSignal(str, str, str)  # source_text, translated_text, elapsed
+    cloud_refinement_ready = pyqtSignal(str, str, str, str, str)  # source_text, refined_text, source_lang, target_lang, elapsed
+
+    def __init__(
+        self,
+        audio_handler,
+        stt_service,
+        translation_service,
+        tts_service,
+        language_service,
+        cache,
+        claude_client,
+        stt_only,
+        max_duration: int,
+    ):
+        super().__init__()
+        self.audio_handler = audio_handler
+        self.stt_service = stt_service
+        self.translation_service = translation_service
+        self.tts_service = tts_service
+        self.language_service = language_service
+        self.cache = cache
+        self.claude_client = claude_client
+        self.stt_only = stt_only
+        self.max_duration = max_duration
+        self.stop_requested = False
+        self.partial_interval = 1.0
+        self.min_audio_seconds = 0.75
+        self.last_processed_samples = 0
+        self.last_source_text = ""
+        self.last_translated_text = ""
+        self.partial_stt_runs = 0
+        self.partial_stt_wall = 0.0
+        self.partial_stt_cpu = 0.0
+        self.partial_translation_runs = 0
+        self.partial_translation_wall = 0.0
+        self.partial_translation_cpu = 0.0
+
+    def stop(self):
+        """Request the streaming loop to stop."""
+        self.stop_requested = True
+        self.audio_handler.stop_recording()
+
+    def _translate_for_display(self, text: str, source_lang: str, target_lang: str):
+        """Translate text for live display, preferring cached results."""
+        if self.stt_only:
+            return "STT-only mode: translation skipped"
+
+        cached = self.cache.get_best(text, source_lang, target_lang)
+        if cached:
+            return cached["translated_text"]
+
+        translated_text, _ = self.translation_service.translate(text, source_lang, target_lang)
+        if translated_text:
+            self.cache.set(text, source_lang, target_lang, translated_text)
+        return translated_text
+
+    def run(self):
+        """Capture audio, emit partial transcripts/translations, then finalize."""
+        start_time = time.time()
+        pipeline_start = take_perf_sample()
+        source_lang, target_lang = self.language_service.get_current_pair()
+        source_lang_code = self.language_service.get_language_code(source_lang)
+
+        try:
+            self.progress.emit(f"Listening for {source_lang}...")
+            self.audio_handler.start_stream_recording()
+
+            while not self.stop_requested:
+                if time.time() - start_time >= self.max_duration:
+                    self.progress.emit("Max recording duration reached")
+                    break
+
+                time.sleep(self.partial_interval)
+                snapshot = self.audio_handler.get_recording_snapshot()
+                if snapshot is None:
+                    continue
+                if len(snapshot) < int(self.min_audio_seconds * self.audio_handler.sample_rate):
+                    continue
+                if len(snapshot) - self.last_processed_samples < int(0.5 * self.audio_handler.sample_rate):
+                    continue
+
+                stt_start = take_perf_sample()
+                text, _, _ = self.stt_service.transcribe(snapshot, language=source_lang_code)
+                stt_end = take_perf_sample()
+                stt_metrics = stage_metrics(stt_start, stt_end)
+                self.partial_stt_runs += 1
+                self.partial_stt_wall += stt_metrics["wall_seconds"]
+                self.partial_stt_cpu += stt_metrics["total_cpu_seconds"]
+                self.last_processed_samples = len(snapshot)
+                if not text or text == self.last_source_text:
+                    continue
+
+                translate_start = take_perf_sample()
+                translated_text = self._translate_for_display(text, source_lang, target_lang)
+                translate_end = take_perf_sample()
+                translate_metrics = stage_metrics(translate_start, translate_end)
+                self.partial_translation_runs += 1
+                self.partial_translation_wall += translate_metrics["wall_seconds"]
+                self.partial_translation_cpu += translate_metrics["total_cpu_seconds"]
+                if not translated_text:
+                    translated_text = "Translating..."
+
+                self.last_source_text = text
+                self.last_translated_text = translated_text
+                self.partial_update.emit(text, translated_text)
+
+            final_audio = self.audio_handler.stop_stream_recording()
+            if final_audio is None or len(final_audio) == 0:
+                self.error.emit("Failed to capture audio. Try again.")
+                return
+
+            self.progress.emit("Finalizing transcription...")
+            final_stt_start = take_perf_sample()
+            final_text, _, _ = self.stt_service.transcribe(final_audio, language=source_lang_code)
+            final_stt_end = take_perf_sample()
+            if not final_text:
+                self.error.emit("Failed to recognize speech. Try again.")
+                return
+
+            final_translation_start = take_perf_sample()
+            final_translated = self._translate_for_display(final_text, source_lang, target_lang)
+            final_translation_end = take_perf_sample()
+            if not final_translated:
+                self.error.emit("Translation failed. Try again.")
+                return
+
+            if not self.stt_only:
+                self.progress.emit("Converting to speech...")
+                tts_start = take_perf_sample()
+                if not self.tts_service.speak(final_translated, target_lang):
+                    self.error.emit("Text-to-speech failed.")
+                    return
+                tts_end = take_perf_sample()
+            else:
+                tts_start = None
+                tts_end = None
+
+            elapsed = f"{time.time() - start_time:.2f}s"
+            pipeline_end = take_perf_sample()
+
+            self.progress.emit(
+                format_stage_metrics("Final STT", final_stt_start, final_stt_end)
+            )
+            self.progress.emit(
+                format_stage_metrics("Final translation", final_translation_start, final_translation_end)
+            )
+            if self.partial_stt_runs:
+                self.progress.emit(
+                    summarize_aggregate(
+                        "Live STT",
+                        self.partial_stt_wall,
+                        self.partial_stt_cpu,
+                        self.partial_stt_runs,
+                    )
+                )
+            if self.partial_translation_runs:
+                self.progress.emit(
+                    summarize_aggregate(
+                        "Live translation",
+                        self.partial_translation_wall,
+                        self.partial_translation_cpu,
+                        self.partial_translation_runs,
+                    )
+                )
+            if tts_start is not None and tts_end is not None:
+                self.progress.emit(format_stage_metrics("TTS", tts_start, tts_end))
+            self.progress.emit(format_stage_metrics("Pipeline total", pipeline_start, pipeline_end))
+
+            cached = self.cache.get_best(final_text, source_lang, target_lang)
+            if self.claude_client.is_enabled() and not (cached and cached["cloud_refined"]):
+                self.progress.emit("Queuing for cloud refinement...")
+                refine_started = time.time()
+
+                def notify_refined(refined):
+                    refine_elapsed = f"{time.time() - refine_started:.2f}s"
+                    self.cloud_refinement_ready.emit(
+                        final_text,
+                        refined,
+                        source_lang,
+                        target_lang,
+                        refine_elapsed,
+                    )
+
+                self.claude_client.refine_translation_async(
+                    final_text,
+                    final_translated,
+                    source_lang,
+                    target_lang,
+                    callback=notify_refined,
+                )
+
+            self.final_result_ready.emit(final_text, final_translated, elapsed)
+
+        except Exception as e:
+            logger.error(f"Streaming pipeline error: {e}")
+            self.error.emit(f"Error: {str(e)}")
+        finally:
+            self.audio_handler.stop_recording()
+            self.work_finished.emit()
 
 
 class TranslationWorker(QThread):
     """Worker thread for running translation pipeline"""
 
-    finished = pyqtSignal()
+    work_finished = pyqtSignal()
     error = pyqtSignal(str)
     progress = pyqtSignal(str)
     result_ready = pyqtSignal(str, str, str)  # source_text, translated_text, time_taken
+    cloud_refinement_ready = pyqtSignal(str, str, str, str, str)  # source_text, refined_text, source_lang, target_lang, elapsed
 
     def __init__(
         self,
@@ -165,6 +376,7 @@ class TranslationWorker(QThread):
     def run(self):
         """Run translation pipeline in background"""
         start_time = time.time()
+        pipeline_start = take_perf_sample()
 
         try:
             source_lang, target_lang = self.language_service.get_current_pair()
@@ -172,10 +384,12 @@ class TranslationWorker(QThread):
 
             # Step 1: Speech-to-Text
             self.progress.emit(f"Running speech-to-text for {source_lang}...")
+            stt_start = take_perf_sample()
             text, detected_lang, confidence = self.stt_service.transcribe(
                 self.audio_data,
                 language=source_lang_code,
             )
+            stt_end = take_perf_sample()
 
             if not text:
                 self.error.emit("Failed to recognize speech. Try again.")
@@ -185,6 +399,9 @@ class TranslationWorker(QThread):
 
             if self.stt_only:
                 elapsed = time.time() - start_time
+                pipeline_end = take_perf_sample()
+                self.progress.emit(format_stage_metrics("STT", stt_start, stt_end))
+                self.progress.emit(format_stage_metrics("Pipeline total", pipeline_start, pipeline_end))
                 self.progress.emit("STT test complete")
                 self.result_ready.emit(text, "STT-only mode: translation skipped", f"{elapsed:.2f}s")
                 return
@@ -193,12 +410,17 @@ class TranslationWorker(QThread):
             self.progress.emit("Translating...")
 
             # Check cache first
-            cached = self.cache.get(text, source_lang, target_lang)
+            cached = self.cache.get_best(text, source_lang, target_lang)
             if cached:
                 translated_text = cached["translated_text"]
-                self.progress.emit("Using cached translation")
+                if cached["cloud_refined"]:
+                    self.progress.emit("Using cached cloud-refined translation")
+                else:
+                    self.progress.emit("Using cached translation")
             else:
+                translation_start = take_perf_sample()
                 translated_text, _ = self.translation_service.translate(text, source_lang, target_lang)
+                translation_end = take_perf_sample()
 
                 if not translated_text:
                     self.error.emit("Translation failed. Try again.")
@@ -206,28 +428,49 @@ class TranslationWorker(QThread):
 
                 # Cache the translation
                 self.cache.set(text, source_lang, target_lang, translated_text)
+            if cached:
+                translation_start = take_perf_sample()
+                translation_end = translation_start
 
             self.progress.emit(f"Translated: {translated_text[:50]}...")
 
             # Step 3: Text-to-Speech
             self.progress.emit("Converting to speech...")
+            tts_start = take_perf_sample()
             if not self.tts_service.speak(translated_text, target_lang):
                 self.error.emit("Text-to-speech failed.")
                 return
+            tts_end = take_perf_sample()
 
             elapsed = time.time() - start_time
+            pipeline_end = take_perf_sample()
+            self.progress.emit(format_stage_metrics("STT", stt_start, stt_end))
+            self.progress.emit(format_stage_metrics("Translation", translation_start, translation_end))
+            self.progress.emit(format_stage_metrics("TTS", tts_start, tts_end))
+            self.progress.emit(format_stage_metrics("Pipeline total", pipeline_start, pipeline_end))
             self.progress.emit(f"Complete in {elapsed:.2f}s")
 
             # Step 4: Cloud refinement (async, non-blocking)
-            if self.claude_client.is_enabled():
+            if self.claude_client.is_enabled() and not (cached and cached["cloud_refined"]):
                 self.progress.emit("Queuing for cloud refinement...")
+                refine_started = time.time()
 
-                def update_cache_with_refined(refined):
-                    self.cache.set_cloud_refinement(text, source_lang, target_lang, refined)
-                    self.progress.emit(f"Cloud refinement complete")
+                def notify_refined(refined):
+                    elapsed = f"{time.time() - refine_started:.2f}s"
+                    self.cloud_refinement_ready.emit(
+                        text,
+                        refined,
+                        source_lang,
+                        target_lang,
+                        elapsed,
+                    )
 
                 self.claude_client.refine_translation_async(
-                    text, translated_text, source_lang, target_lang, callback=update_cache_with_refined
+                    text,
+                    translated_text,
+                    source_lang,
+                    target_lang,
+                    callback=notify_refined,
                 )
 
             # Emit result
@@ -238,11 +481,13 @@ class TranslationWorker(QThread):
             self.error.emit(f"Error: {str(e)}")
 
         finally:
-            self.finished.emit()
+            self.work_finished.emit()
 
 
 class MainWindow(QMainWindow):
     """Main application window"""
+
+    connectivity_changed_signal = pyqtSignal(bool)
 
     def __init__(self):
         super().__init__()
@@ -262,7 +507,7 @@ class MainWindow(QMainWindow):
         self.audio_handler = AudioHandler(sample_rate=16000)
         self.cache = TranslationCache(db_path="cache.db")
         self.audio_config = self.config.get_audio_config()
-        self.stt_only_mode = True
+        self.stt_only_mode = False
 
         # State
         self.is_recording = False
@@ -270,7 +515,9 @@ class MainWindow(QMainWindow):
         self.is_streaming = False
         self.recording_thread = None
         self.streaming_stt_worker = None
+        self.streaming_pipeline_worker = None
         self.worker_thread = None
+        self.last_live_log_text = ""
 
         # UI Setup
         self._init_ui()
@@ -399,7 +646,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
 
         # Update initial state
-        self.status_label.setText("STT Test Mode")
+        self.status_label.setText("Ready")
         self._update_language_display()
         self._update_connectivity_display()
 
@@ -415,7 +662,8 @@ class MainWindow(QMainWindow):
         self.settings_btn.clicked.connect(self._on_settings)
 
         # Connectivity callback
-        self.connectivity_service.add_callback(self._on_connectivity_changed)
+        self.connectivity_changed_signal.connect(self._on_connectivity_changed)
+        self.connectivity_service.add_callback(self.connectivity_changed_signal.emit)
 
         # Log signal
         logger.info("All signals connected")
@@ -447,12 +695,13 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage("Recording...")
         self._log("Recording audio...")
+        self.last_live_log_text = ""
         self.status_label.setText("Listening...")
 
+        self.is_streaming = True
         if self.stt_only_mode:
             source_lang, _ = self.language_service.get_current_pair()
             source_lang_code = self.language_service.get_language_code(source_lang)
-            self.is_streaming = True
             self.streaming_stt_worker = StreamingSTTWorker(
                 self.audio_handler,
                 self.stt_service,
@@ -468,13 +717,24 @@ class MainWindow(QMainWindow):
             self.streaming_stt_worker.start()
             return
 
-        self.recording_thread = RecordingWorker(
+        self.streaming_pipeline_worker = StreamingPipelineWorker(
             self.audio_handler,
+            self.stt_service,
+            self.translation_service,
+            self.tts_service,
+            self.language_service,
+            self.cache,
+            self.claude_client,
+            self.stt_only_mode,
             self.audio_config.get("max_duration", 10),
         )
-        self.recording_thread.audio_ready.connect(self._on_audio_recorded)
-        self.recording_thread.error.connect(self._on_recording_error)
-        self.recording_thread.start()
+        self.streaming_pipeline_worker.progress.connect(self._on_progress)
+        self.streaming_pipeline_worker.partial_update.connect(self._on_partial_pipeline_update)
+        self.streaming_pipeline_worker.final_result_ready.connect(self._on_result_ready)
+        self.streaming_pipeline_worker.cloud_refinement_ready.connect(self._on_cloud_refinement_ready)
+        self.streaming_pipeline_worker.error.connect(self._on_error)
+        self.streaming_pipeline_worker.finished.connect(self._on_streaming_pipeline_finished)
+        self.streaming_pipeline_worker.start()
 
     def _on_ptt_released(self, event):
         """Handle PTT button release"""
@@ -487,6 +747,8 @@ class MainWindow(QMainWindow):
         self.ptt_button.setEnabled(False)
         if self.streaming_stt_worker is not None:
             self.streaming_stt_worker.stop()
+        if self.streaming_pipeline_worker is not None:
+            self.streaming_pipeline_worker.stop()
 
     def _reset_ptt_button(self):
         """Restore the default push-to-talk button style."""
@@ -557,6 +819,7 @@ class MainWindow(QMainWindow):
         self.worker_thread.progress.connect(self._on_progress)
         self.worker_thread.error.connect(self._on_error)
         self.worker_thread.result_ready.connect(self._on_result_ready)
+        self.worker_thread.cloud_refinement_ready.connect(self._on_cloud_refinement_ready)
         self.worker_thread.finished.connect(self._on_processing_finished)
 
         self.worker_thread.start()
@@ -570,6 +833,15 @@ class MainWindow(QMainWindow):
         """Show partial STT output while the user is still speaking."""
         self.source_text.setText(text)
         self.translated_text.setText("Streaming STT active...")
+
+    def _on_partial_pipeline_update(self, source_text: str, translated_text: str):
+        """Show partial STT and translation output while the user is still speaking."""
+        self.source_text.setText(source_text)
+        self.translated_text.setText(translated_text)
+        self.statusBar().showMessage("Streaming translation...")
+        if source_text and source_text != self.last_live_log_text:
+            self.last_live_log_text = source_text
+            self._log(f"Live update: {source_text[:60]}...")
 
     def _on_final_stt_ready(self, text: str, elapsed: str):
         """Handle the finalized streaming STT result."""
@@ -588,12 +860,28 @@ class MainWindow(QMainWindow):
         self.translated_text.setText(translated_text)
         self._log(f"✓ Complete in {elapsed}")
 
+    def _on_cloud_refinement_ready(
+        self,
+        source_text: str,
+        refined_text: str,
+        source_lang: str,
+        target_lang: str,
+        elapsed: str,
+    ):
+        """Handle async cloud refinement on the GUI thread."""
+        self.cache.set_cloud_refinement(source_text, source_lang, target_lang, refined_text)
+        if self.source_text.toPlainText().strip() == source_text.strip():
+            self.translated_text.setText(refined_text)
+        self._log(f"Cloud refinement complete in {elapsed}")
+        self.statusBar().showMessage("Cloud refinement complete")
+
     def _on_processing_finished(self):
         """Handle when processing finishes"""
         self.is_processing = False
         self.ptt_button.setEnabled(True)
         self.progress_bar.setVisible(False)
-        self.status_label.setText("STT Ready" if self.stt_only_mode else "GUI Ready")
+        self.status_label.setText("STT Ready" if self.stt_only_mode else "Ready")
+        self.worker_thread = None
 
     def _on_streaming_stt_finished(self):
         """Handle when streaming STT stops."""
@@ -602,6 +890,14 @@ class MainWindow(QMainWindow):
         self.ptt_button.setEnabled(True)
         self.status_label.setText("STT Ready")
         self.streaming_stt_worker = None
+
+    def _on_streaming_pipeline_finished(self):
+        """Handle when the streaming translation pipeline stops."""
+        self.is_streaming = False
+        self._reset_ptt_button()
+        self.ptt_button.setEnabled(True)
+        self.status_label.setText("Ready")
+        self.streaming_pipeline_worker = None
 
     def _on_prev_language(self):
         """Switch to previous language pair"""
@@ -646,6 +942,10 @@ class MainWindow(QMainWindow):
         timestamp = time.strftime("%H:%M:%S")
         log_message = f"[{timestamp}] {message}"
         self.log_display.append(log_message)
+        if message.startswith("ERROR: "):
+            logger.error(message[7:])
+        else:
+            logger.info(message)
         # Auto-scroll to bottom
         self.log_display.verticalScrollBar().setValue(
             self.log_display.verticalScrollBar().maximum()
@@ -659,7 +959,10 @@ class MainWindow(QMainWindow):
             try:
                 self.status_label.setText("Loading STT...")
                 self.statusBar().showMessage("Loading speech-to-text model...")
+                load_start = take_perf_sample()
                 self.stt_service = get_stt_service()
+                load_end = take_perf_sample()
+                self._log(format_stage_metrics("STT load", load_start, load_end))
             except Exception as e:
                 logger.error(f"Failed to initialize STT service: {e}")
                 errors.append(f"Speech-to-text unavailable: {e}")
@@ -680,7 +983,10 @@ class MainWindow(QMainWindow):
             try:
                 self.status_label.setText("Loading Translation...")
                 self.statusBar().showMessage("Loading translation model...")
+                load_start = take_perf_sample()
                 self.translation_service = get_translation_service()
+                load_end = take_perf_sample()
+                self._log(format_stage_metrics("Translation load", load_start, load_end))
             except Exception as e:
                 logger.error(f"Failed to initialize translation service: {e}")
                 errors.append(f"Translation unavailable: {e}")
@@ -689,7 +995,10 @@ class MainWindow(QMainWindow):
             try:
                 self.status_label.setText("Loading TTS...")
                 self.statusBar().showMessage("Loading text-to-speech engine...")
+                load_start = take_perf_sample()
                 self.tts_service = get_tts_service()
+                load_end = take_perf_sample()
+                self._log(format_stage_metrics("TTS load", load_start, load_end))
             except Exception as e:
                 logger.error(f"Failed to initialize TTS service: {e}")
                 errors.append(f"Text-to-speech unavailable: {e}")
@@ -709,6 +1018,14 @@ class MainWindow(QMainWindow):
         logger.info("Shutting down...")
         if self.streaming_stt_worker is not None:
             self.streaming_stt_worker.stop()
+            self.streaming_stt_worker.wait(5000)
+        if self.streaming_pipeline_worker is not None:
+            self.streaming_pipeline_worker.stop()
+            self.streaming_pipeline_worker.wait(5000)
+        if self.recording_thread is not None and self.recording_thread.isRunning():
+            self.recording_thread.wait(5000)
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            self.worker_thread.wait(5000)
         self.connectivity_service.stop_monitoring()
         if self.tts_service is not None:
             self.tts_service.shutdown()

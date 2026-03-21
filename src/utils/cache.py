@@ -68,6 +68,20 @@ class TranslationCache:
                 }
             return None
 
+    def get_best(self, source_text, source_lang, target_lang):
+        """Get the best cached translation, preferring cloud-refined text when present."""
+        cached = self.get(source_text, source_lang, target_lang)
+        if not cached:
+            return None
+
+        best_text = cached["cloud_refined"] or cached["translated_text"]
+        return {
+            "translated_text": best_text,
+            "confidence": cached["confidence"],
+            "cloud_refined": cached["cloud_refined"],
+            "base_translation": cached["translated_text"],
+        }
+
     def set(self, source_text, source_lang, target_lang, translated_text, confidence=0.95):
         """Cache a translation"""
         with sqlite3.connect(self.db_path) as conn:

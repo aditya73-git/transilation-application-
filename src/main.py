@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.utils.logger import setup_logger, create_log_file
 from src.config import get_config
+from src.startup_preflight import prime_required_assets
 from src.ui.main_window import MainWindow
 
 
@@ -18,7 +19,12 @@ def main():
     log_file = create_log_file("logs")
     config = get_config()
     debug_mode = config.is_debug_mode()
-    setup_logger("", debug_mode=debug_mode, log_file=log_file)
+    setup_logger(
+        "",
+        debug_mode=debug_mode,
+        log_file=log_file,
+        log_level=config.get_log_level(),
+    )
 
     logger = logging.getLogger(__name__)
     logger.info("=" * 60)
@@ -28,6 +34,13 @@ def main():
     # Check Python version
     if sys.version_info < (3, 9):
         logger.error("Python 3.9+ required")
+        sys.exit(1)
+
+    try:
+        logger.info("Running startup preflight for offline model assets...")
+        prime_required_assets(config)
+    except Exception as e:
+        logger.error(f"Startup preflight failed: {e}", exc_info=True)
         sys.exit(1)
 
     # Create application

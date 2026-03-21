@@ -85,19 +85,29 @@ class Config:
             "vad_filter": self.config.get("offline", {}).get("whisper_vad_filter", True),
         }
 
-    def get_m2m_model(self):
-        """Get M2M-100 model configuration"""
+    def get_translation_config(self):
+        """Get translation model configuration."""
         return {
-            "model": self.config.get("offline", {}).get("m2m_model", "facebook/m2m100_418M"),
-            "device": self.config.get("offline", {}).get("m2m_device", "cpu"),
+            "strategy": self.config.get("offline", {}).get("translation_strategy", "pivot_english"),
+            "pivot_language": self.config.get("offline", {}).get("translation_pivot_language", "english"),
+            "device": self.config.get("offline", {}).get("translation_device", "cpu"),
+            "max_loaded_models": self.config.get("offline", {}).get("translation_max_loaded_models", 2),
+            "models": self.config.get("offline", {}).get("translation_models", {}),
         }
+
+    def get_m2m_model(self):
+        """Backward-compatible alias for translation configuration."""
+        return self.get_translation_config()
 
     def get_tts_config(self):
         """Get TTS configuration"""
         return {
-            "engine": self.config.get("offline", {}).get("tts_engine", "pyttsx3"),
+            "engine": self.config.get("offline", {}).get("tts_engine", "piper"),
             "speed": self.config.get("offline", {}).get("tts_voice_speed", 1.0),
             "volume": self.config.get("offline", {}).get("tts_voice_volume", 1.0),
+            "piper_binary": self.config.get("offline", {}).get("piper_binary", "piper"),
+            "piper_play_command": self.config.get("offline", {}).get("piper_play_command", "auto"),
+            "piper_voice_models": self.config.get("offline", {}).get("piper_voice_models", {}),
         }
 
     def get_audio_config(self):
@@ -115,6 +125,10 @@ class Config:
     def is_debug_mode(self):
         """Check if debug mode is enabled"""
         return self.config.get("device", {}).get("debug_mode", False)
+
+    def get_log_level(self):
+        """Get configured application log level."""
+        return self.config.get("device", {}).get("log_level", "INFO")
 
     def __repr__(self):
         return f"<Config: {self.config_path}>"

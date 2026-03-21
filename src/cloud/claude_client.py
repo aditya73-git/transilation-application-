@@ -1,8 +1,9 @@
-"""Claude API client for translation refinement"""
-import requests
-import json
+"""Claude API client for translation refinement."""
 import threading
 from typing import Optional, Callable
+
+import requests
+
 from src.utils.logger import get_logger
 from src.config import get_config
 
@@ -10,22 +11,36 @@ logger = get_logger(__name__)
 
 
 class ClaudeClient:
-    """Client for Claude API-based translation refinement"""
+    """Client for Claude API-based translation refinement."""
 
     CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
     def __init__(self):
-        """Initialize Claude client"""
+        """Initialize Claude client."""
         config = get_config()
         self.cloud_config = config.get_cloud_config()
         self.api_key = self.cloud_config.get("claude_api_key", "")
         self.model = self.cloud_config.get("refinement_model", "claude-3-5-sonnet-20241022")
-        self.enabled = self.cloud_config.get("enabled", False) and bool(self.api_key)
+        self.use_refinement = self.cloud_config.get("use_refinement", False)
+        self.enabled = (
+            self.cloud_config.get("enabled", False)
+            and self.use_refinement
+            and bool(self.api_key)
+        )
+        self.session = requests.Session()
 
         if self.enabled:
             logger.info(f"Claude client initialized (model: {self.model})")
         else:
-            logger.info("Claude client disabled (no API key)")
+            logger.info("Claude client disabled")
+
+    def _headers(self):
+        """Build Anthropic request headers."""
+        return {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
 
     def refine_translation(self, original_text: str, translated_text: str,
                           source_lang: str, target_lang: str) -> Optional[str]:
@@ -45,18 +60,15 @@ class ClaudeClient:
             return None
 
         try:
-            prompt = f"""You are a professional translator. Refine the following translation to make it more natural and accurate.
+            prompt = f"""You are an expert bilingual editor.
+Improve the translation so it sounds natural to a native {target_lang} speaker while preserving the exact meaning.
+Keep names, numbers, and factual details unchanged.
+Do not explain your work and do not add quotation marks.
 
 Original text ({source_lang}): {original_text}
 Current translation ({target_lang}): {translated_text}
 
-Provide only the refined translation without any explanation."""
-
-            headers = {
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            }
+Return only the improved {target_lang} translation."""
 
             payload = {
                 "model": self.model,
@@ -64,9 +76,9 @@ Provide only the refined translation without any explanation."""
                 "messages": [{"role": "user", "content": prompt}],
             }
 
-            response = requests.post(
+            response = self.session.post(
                 self.CLAUDE_API_URL,
-                headers=headers,
+                headers=self._headers(),
                 json=payload,
                 timeout=10,
             )
@@ -114,30 +126,24 @@ Provide only the refined translation without any explanation."""
         thread.start()
 
     def is_enabled(self) -> bool:
-        """Check if Claude client is enabled"""
+        """Check if Claude client is enabled."""
         return self.enabled
 
     def test_connection(self) -> bool:
-        """Test connection to Claude API"""
+        """Test connection to Claude API."""
         if not self.enabled:
             return False
 
         try:
-            headers = {
-                "x-api-key": self.api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            }
-
             payload = {
                 "model": self.model,
                 "max_tokens": 10,
                 "messages": [{"role": "user", "content": "Hi"}],
             }
 
-            response = requests.post(
+            response = self.session.post(
                 self.CLAUDE_API_URL,
-                headers=headers,
+                headers=self._headers(),
                 json=payload,
                 timeout=5,
             )

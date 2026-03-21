@@ -1,111 +1,138 @@
-"""Translation Service using M2M-100 Model"""
-from typing import Tuple
+"""Translation service using lighter Marian/OPUS models with English pivoting."""
+from collections import OrderedDict
+import gc
+from typing import Dict, Optional, Tuple
+
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-from src.utils.logger import get_logger
+
 from src.config import get_config
+from src.startup_preflight import ensure_required_assets, get_cached_snapshot_path
+from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 class TranslationService:
-    """Translation using M2M-100 lightweight model"""
-
-    # Language code mappings for M2M-100
-    LANG_CODE_MAPPING = {
-        "english": "en",
-        "german": "de",
-        "arabic": "ar",
-        "romanian": "ro",
-        "slovakian": "sk",
-        "turkish": "tr",
-        "polish": "pl",
-    }
+    """Translate between the offline GUI languages."""
 
     def __init__(self):
-        """Initialize translation service"""
+        """Initialize translation service."""
         config = get_config()
-        self.config = config.get_m2m_model()
+        self.config = config.get_translation_config()
         self.device = self.config.get("device", "cpu")
-        self.model = None
-        self.tokenizer = None
-        self._load_model()
+        self.strategy = self.config.get("strategy", "pivot_english")
+        self.pivot_language = self.config.get("pivot_language", "english").lower().strip()
+        self.max_loaded_models = max(1, int(self.config.get("max_loaded_models", 2)))
+        self.model_specs = self.config.get("models", {})
+        self.loaded_pipelines = OrderedDict()
 
-    def _load_model(self):
-        """Load M2M-100 model and tokenizer"""
-        try:
-            model_name = self.config.get("model", "facebook/m2m100_418M")
-            logger.info(f"Loading M2M-100 model: {model_name}")
+    def _normalize_language(self, language: str) -> str:
+        """Normalize a language name from the GUI."""
+        return language.lower().strip()
 
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    def _get_model_spec(self, source_lang: str, target_lang: str) -> Optional[Dict[str, str]]:
+        """Return the configured model spec for one direct translation hop."""
+        source_lang = self._normalize_language(source_lang)
+        target_lang = self._normalize_language(target_lang)
+        return self.model_specs.get(source_lang, {}).get(target_lang)
 
-            # Move to device
-            self.model = self.model.to(self.device)
+    def _load_pipeline(self, model_name: str):
+        """Load or reuse a translation pipeline."""
+        if model_name in self.loaded_pipelines:
+            tokenizer, model = self.loaded_pipelines.pop(model_name)
+            self.loaded_pipelines[model_name] = (tokenizer, model)
+            return tokenizer, model
 
-            # Set to evaluation mode
-            self.model.eval()
+        logger.info("Loading translation model: %s", model_name)
+        local_model_path = get_cached_snapshot_path(model_name)
+        if local_model_path is None:
+            local_model_path = ensure_required_assets(get_config(), local_files_only=True)[model_name]
 
-            logger.info(f"M2M-100 model loaded successfully on {self.device}")
+        tokenizer = AutoTokenizer.from_pretrained(local_model_path, local_files_only=True)
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            local_model_path,
+            local_files_only=True,
+            use_safetensors=False,
+        )
+        model = model.to(self.device)
+        model.eval()
+        self.loaded_pipelines[model_name] = (tokenizer, model)
 
-        except Exception as e:
-            logger.error(f"Failed to load M2M-100 model: {e}")
-            raise
+        while len(self.loaded_pipelines) > self.max_loaded_models:
+            old_model_name, (_, old_model) = self.loaded_pipelines.popitem(last=False)
+            logger.info("Unloading translation model: %s", old_model_name)
+            del old_model
+            gc.collect()
+            if self.device.startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    def translate(self, text: str, source_lang: str, target_lang: str) -> Tuple[str, float]:
-        """
-        Translate text from source to target language
+        logger.info("Translation model ready on %s", self.device)
+        return tokenizer, model
 
-        Args:
-            text: Text to translate
-            source_lang: Source language name (e.g., 'english')
-            target_lang: Target language name (e.g., 'german')
+    def _translate_direct(self, text: str, source_lang: str, target_lang: str) -> str:
+        """Translate a single hop using a configured pair model."""
+        spec = self._get_model_spec(source_lang, target_lang)
+        if spec is None:
+            raise ValueError(f"No offline translation model configured for {source_lang} -> {target_lang}")
 
-        Returns:
-            Tuple of (translated_text, confidence)
-        """
-        if self.model is None or self.tokenizer is None:
-            logger.error("Model not loaded")
-            return "", 0.0
+        tokenizer, model = self._load_pipeline(spec["model"])
+        input_prefix = spec.get("input_prefix", "")
+        input_text = f"{input_prefix}{text}" if input_prefix else text
+        inputs = tokenizer(
+            input_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        ).to(self.device)
 
-        try:
-            # Normalize language names
-            source_lang = source_lang.lower().strip()
-            target_lang = target_lang.lower().strip()
-
-            # Get language codes
-            source_code = self.LANG_CODE_MAPPING.get(source_lang, source_lang)
-            target_code = self.LANG_CODE_MAPPING.get(target_lang, target_lang)
-
-            logger.info(
-                f"Translating ({source_code}→{target_code}): {text[:50]}..."
+        with torch.no_grad():
+            generated_tokens = model.generate(
+                **inputs,
+                max_length=512,
+                num_beams=1,
             )
 
-            # Set target language
-            self.tokenizer.tgt_lang = target_code
+        return tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0].strip()
 
-            # Encode input
-            inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
+    def translate(self, text: str, source_lang: str, target_lang: str) -> Tuple[str, float]:
+        """Translate text from source to target language."""
+        try:
+            source_lang = self._normalize_language(source_lang)
+            target_lang = self._normalize_language(target_lang)
+            text = text.strip()
 
-            # Generate translation
-            with torch.no_grad():
-                generated_tokens = self.model.generate(
-                    **inputs,
-                    forced_bos_token_id=self.tokenizer.get_lang_id(target_code),
-                    max_length=512,
-                    num_beams=5,
-                    early_stopping=True,
+            if not text:
+                return "", 0.0
+
+            if source_lang == target_lang:
+                return text, 1.0
+
+            logger.info("Translating (%s -> %s): %s...", source_lang, target_lang, text[:50])
+
+            if self._get_model_spec(source_lang, target_lang):
+                translated_text = self._translate_direct(text, source_lang, target_lang)
+                confidence = 0.85
+            else:
+                if self.strategy != "pivot_english":
+                    raise ValueError(f"No direct translation route configured for {source_lang} -> {target_lang}")
+
+                if self._get_model_spec(source_lang, self.pivot_language) is None:
+                    raise ValueError(f"No offline route configured for {source_lang} -> {self.pivot_language}")
+                if self._get_model_spec(self.pivot_language, target_lang) is None:
+                    raise ValueError(f"No offline route configured for {self.pivot_language} -> {target_lang}")
+
+                pivot_text = self._translate_direct(text, source_lang, self.pivot_language)
+                translated_text = self._translate_direct(pivot_text, self.pivot_language, target_lang)
+                confidence = 0.72
+                logger.info(
+                    "Pivot translation used (%s -> %s -> %s)",
+                    source_lang,
+                    self.pivot_language,
+                    target_lang,
                 )
 
-            # Decode output
-            translated_text = self.tokenizer.batch_decode(
-                generated_tokens, skip_special_tokens=True
-            )[0]
-
-            # Confidence is typically high for this model
-            confidence = 0.85
-
-            logger.info(f"Translation complete: {translated_text[:50]}...")
+            logger.info("Translation complete: %s...", translated_text[:50])
             return translated_text, confidence
 
         except Exception as e:
@@ -113,17 +140,7 @@ class TranslationService:
             return "", 0.0
 
     def translate_batch(self, texts: list, source_lang: str, target_lang: str) -> list:
-        """
-        Translate multiple texts at once (more efficient)
-
-        Args:
-            texts: List of texts to translate
-            source_lang: Source language
-            target_lang: Target language
-
-        Returns:
-            List of translated texts
-        """
+        """Translate multiple texts one by one."""
         results = []
         for text in texts:
             translated, _ = self.translate(text, source_lang, target_lang)
@@ -131,30 +148,33 @@ class TranslationService:
         return results
 
     def get_supported_languages(self):
-        """Get list of supported languages"""
-        return list(self.LANG_CODE_MAPPING.keys())
+        """Get list of supported languages."""
+        languages = set(self.model_specs.keys())
+        for targets in self.model_specs.values():
+            languages.update(targets.keys())
+        return sorted(languages)
 
     def set_device(self, device: str):
-        """Change device (cpu or cuda)"""
+        """Change device (cpu or cuda)."""
         self.device = device
-        if self.model is not None:
-            self.model = self.model.to(device)
-            logger.info(f"Model moved to {device}")
+        self.unload_model()
+        logger.info("Translation service moved to %s", device)
 
     def unload_model(self):
-        """Unload model to free memory"""
-        if self.model is not None:
-            self.model = None
-            self.tokenizer = None
-            logger.info("M2M-100 model unloaded")
+        """Unload translation models to free memory."""
+        if self.loaded_pipelines:
+            self.loaded_pipelines.clear()
+            gc.collect()
+            if self.device.startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.info("Translation models unloaded")
 
 
-# Global instance
 _translation_instance = None
 
 
 def get_translation_service() -> TranslationService:
-    """Get global translation service instance"""
+    """Get global translation service instance."""
     global _translation_instance
     if _translation_instance is None:
         _translation_instance = TranslationService()

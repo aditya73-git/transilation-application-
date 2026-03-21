@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 import numpy as np
 import soundfile as sf
 from faster_whisper import WhisperModel
+from src.startup_preflight import get_cached_snapshot_path, resolve_whisper_repo_id, ensure_required_assets
 from src.utils.logger import get_logger
 from src.config import get_config
 
@@ -62,6 +63,11 @@ class STTService:
     def _load_model(self):
         """Load the faster-whisper model."""
         try:
+            repo_id = resolve_whisper_repo_id(self.config["model"])
+            model_path = get_cached_snapshot_path(repo_id)
+            if model_path is None:
+                model_path = ensure_required_assets(get_config(), local_files_only=True)[repo_id]
+
             logger.info(
                 "Loading faster-whisper model: %s (device=%s, compute_type=%s)",
                 self.config["model"],
@@ -69,10 +75,11 @@ class STTService:
                 self.compute_type,
             )
             model_kwargs = {
-                "model_size_or_path": self.config["model"],
+                "model_size_or_path": model_path,
                 "device": self.device,
                 "compute_type": self.compute_type,
                 "num_workers": self.num_workers,
+                "local_files_only": True,
             }
             if self.cpu_threads:
                 model_kwargs["cpu_threads"] = self.cpu_threads

@@ -1,6 +1,6 @@
 # Offline Translator Configuration File
 
-# Supported language pairs
+# Supported offline GUI languages
 languages:
   supported:
     - english
@@ -31,7 +31,7 @@ offline:
   # Whisper STT model size (tiny, base, small, medium, large)
   # For laptops: use small or base
   # For Pi: use tiny
-  whisper_model: base
+  whisper_model: small
   whisper_device: cpu  # cpu or cuda
   whisper_compute_type: int8  # int8 is a good default for CPU / Raspberry Pi
   whisper_cpu_threads: 0      # 0 = let runtime choose
@@ -39,15 +39,89 @@ offline:
   whisper_beam_size: 1        # lower beam size for faster prototype latency
   whisper_vad_filter: true
 
-  # M2M-100 translation model
-  # 418M is lightweight but good quality
-  m2m_model: facebook/m2m100_418M
-  m2m_device: cpu  # cpu or cuda
+  # Translation runtime
+  # Pair-specific Marian/OPUS models are lighter than one giant multilingual model.
+  # We support full X -> Y translation by pivoting through English when needed.
+  translation_strategy: pivot_english
+  translation_pivot_language: english
+  translation_device: cpu  # cpu or cuda
+  translation_max_loaded_models: 2
+  translation_models:
+    english:
+      german:
+        model: Helsinki-NLP/opus-mt-en-de
+      arabic:
+        model: Helsinki-NLP/opus-mt-tc-big-en-ar
+      romanian:
+        model: Helsinki-NLP/opus-mt-en-ro
+      slovakian:
+        model: Helsinki-NLP/opus-mt-en-sk
+      turkish:
+        model: Helsinki-NLP/opus-mt-tc-big-en-tr
+      polish:
+        model: Helsinki-NLP/opus-mt-en-zlw
+        input_prefix: ">>pol<< "
+    german:
+      english:
+        model: Helsinki-NLP/opus-mt-de-en
+    arabic:
+      english:
+        model: Helsinki-NLP/opus-mt-ar-en
+    romanian:
+      english:
+        model: Helsinki-NLP/opus-mt-ROMANCE-en
+    slovakian:
+      english:
+        model: Helsinki-NLP/opus-mt-sk-en
+    turkish:
+      english:
+        model: Helsinki-NLP/opus-mt-tr-en
+    polish:
+      english:
+        model: Helsinki-NLP/opus-mt-pl-en
 
-  # TTS engine (pyttsx3 is offline and lightweight)
-  tts_engine: pyttsx3
+  # TTS engine
+  tts_engine: piper
   tts_voice_speed: 1.0
   tts_voice_volume: 1.0
+  piper_binary: piper
+  piper_play_command: auto
+  piper_voice_models:
+    english:
+      model: ./models/piper/english.onnx
+      config: ./models/piper/english.onnx.json
+      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx?download=true
+      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json?download=true
+    german:
+      model: ./models/piper/german.onnx
+      config: ./models/piper/german.onnx.json
+      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx?download=true
+      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json?download=true
+    arabic:
+      model: ./models/piper/arabic.onnx
+      config: ./models/piper/arabic.onnx.json
+      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ar/ar_JO/kareem/medium/ar_JO-kareem-medium.onnx?download=true
+      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ar/ar_JO/kareem/medium/ar_JO-kareem-medium.onnx.json?download=true
+    romanian:
+      model: ./models/piper/romanian.onnx
+      config: ./models/piper/romanian.onnx.json
+      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ro/ro_RO/mihai/medium/ro_RO-mihai-medium.onnx?download=true
+      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ro/ro_RO/mihai/medium/ro_RO-mihai-medium.onnx.json?download=true
+    slovakian:
+      model: ./models/piper/slovakian.onnx
+      config: ./models/piper/slovakian.onnx.json
+      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/sk/sk_SK/lili/medium/sk_SK-lili-medium.onnx?download=true
+      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/sk/sk_SK/lili/medium/sk_SK-lili-medium.onnx.json?download=true
+    turkish:
+      model: ./models/piper/turkish.onnx
+      config: ./models/piper/turkish.onnx.json
+      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx?download=true
+      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx.json?download=true
+    polish:
+      model: ./models/piper/polish.onnx
+      config: ./models/piper/polish.onnx.json
+      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/pl/pl_PL/darkman/medium/pl_PL-darkman-medium.onnx?download=true
+      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/pl/pl_PL/darkman/medium/pl_PL-darkman-medium.onnx.json?download=true
 
 # Cloud integration (Claude API for refinements)
 cloud:
@@ -67,7 +141,7 @@ audio:
   sample_rate: 16000  # Hz (Whisper requirement)
   channels: 1  # Mono
   chunk_size: 1024
-  max_duration: 30  # seconds
+  max_duration: 60  # seconds
   silence_threshold: 0.01
   silence_duration: 0.5  # seconds of silence to stop recording
 

@@ -1,4 +1,4 @@
-"""Simple CLI test to verify the translation pipeline works"""
+"""Simple CLI test to verify the translation pipeline works."""
 import sys
 from pathlib import Path
 
@@ -31,9 +31,9 @@ def test_pipeline():
         stt = get_stt_service()
         print("    ✓ faster-whisper loaded")
 
-        print("  - Loading Translation (M2M-100)...")
+        print("  - Loading Translation (Marian pivot translator)...")
         translator = get_translation_service()
-        print("    ✓ M2M-100 loaded")
+        print("    ✓ translation service loaded")
 
         print("  - Loading TTS (pyttsx3)...")
         tts = get_tts_service()
