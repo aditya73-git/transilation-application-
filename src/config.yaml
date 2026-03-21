@@ -1,0 +1,96 @@
+# Offline Translator Configuration File
+
+# Supported language pairs
+languages:
+  supported:
+    - english
+    - german
+    - arabic
+    - romanian
+    - slovakian
+    - turkish
+    - polish
+
+  # Default language pair
+  default_pair:
+    source: english
+    target: german
+
+  # Language code mappings for models
+  code_mappings:
+    english: en
+    german: de
+    arabic: ar
+    romanian: ro
+    slovakian: sk
+    turkish: tr
+    polish: pl
+
+# Offline model configuration
+offline:
+  # Whisper STT model size (tiny, base, small, medium, large)
+  # For laptops: use small or base
+  # For Pi: use tiny
+  whisper_model: base
+  whisper_device: cpu  # cpu or cuda
+
+  # M2M-100 translation model
+  # 418M is lightweight but good quality
+  m2m_model: facebook/m2m100_418M
+  m2m_device: cpu  # cpu or cuda
+
+  # TTS engine (pyttsx3 is offline and lightweight)
+  tts_engine: pyttsx3
+  tts_voice_speed: 1.0
+  tts_voice_volume: 1.0
+
+# Cloud integration (Claude API for refinements)
+cloud:
+  enabled: false  # Set to true to enable Claude refinements
+  openai_api_key: ${OPENAI_API_KEY}
+  claude_api_key: ${CLAUDE_API_KEY}
+
+  # Fallback to cloud if offline fails
+  fallback_to_cloud: true
+
+  # Use cloud for refinement (background, non-blocking)
+  use_refinement: false
+  refinement_model: claude-3-5-sonnet-20241022
+
+# Audio configuration
+audio:
+  sample_rate: 16000  # Hz (Whisper requirement)
+  channels: 1  # Mono
+  chunk_size: 1024
+  max_duration: 30  # seconds
+  silence_threshold: 0.01
+  silence_duration: 0.5  # seconds of silence to stop recording
+
+# Device configuration
+device:
+  device_name: OfflineTranslator
+  timezone: UTC
+  debug_mode: true
+  log_level: INFO  # DEBUG, INFO, WARNING, ERROR
+
+# Cache configuration
+cache:
+  enabled: true
+  db_path: ./cache.db
+  max_cache_size: 100  # MB
+  ttl: 604800  # 7 days in seconds
+
+# UI configuration
+ui:
+  window_width: 1000
+  window_height: 800
+  theme: dark
+  show_processing_times: true
+  show_logs: true
+  auto_play_output: true
+
+# Model download settings
+models:
+  download_path: ./models
+  auto_download: true
+  verify_downloads: true
