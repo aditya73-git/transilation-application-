@@ -27,9 +27,9 @@ def test_pipeline():
     try:
         # Initialize services
         print("▶ Loading services...")
-        print("  - Loading STT (Whisper)...")
+        print("  - Loading STT (faster-whisper)...")
         stt = get_stt_service()
-        print("    ✓ Whisper loaded")
+        print("    ✓ faster-whisper loaded")
 
         print("  - Loading Translation (M2M-100)...")
         translator = get_translation_service()

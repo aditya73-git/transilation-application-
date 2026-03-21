@@ -4,6 +4,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -41,6 +42,10 @@ class AudioHandler:
         self.audio_data = None
         self.is_recording = False
         self.recording_process = None
+        self.recording_stderr = ""
+        self.stream_reader_thread = None
+        self.stream_buffer = bytearray()
+        self.stream_buffer_lock = threading.Lock()
         self.use_sounddevice = SOUNDDEVICE_AVAILABLE
         self.use_pw_record = (not self.use_sounddevice) and PW_RECORD_AVAILABLE and SOUNDFILE_AVAILABLE
         self.use_arecord = (
@@ -82,6 +87,69 @@ class AudioHandler:
 
         logger.warning("Audio devices not available in mock mode")
         return []
+
+    def start_stream_recording(self):
+        """Start recording audio into an internal streaming buffer."""
+        self.audio_data = None
+        self.recording_stderr = ""
+        with self.stream_buffer_lock:
+            self.stream_buffer = bytearray()
+
+        if self.use_mock:
+            self._start_mock_stream()
+            return
+        if self.use_pw_record:
+            self._start_pw_record_stream()
+            return
+        if self.use_arecord:
+            self._start_arecord_stream()
+            return
+
+        self._start_sounddevice_stream()
+
+    def get_recording_snapshot(self):
+        """Get the currently buffered recording as float32 mono audio."""
+        if self.use_mock or self.use_sounddevice:
+            with self.stream_buffer_lock:
+                buffer_copy = bytes(self.stream_buffer)
+            if not buffer_copy:
+                return np.array([], dtype=np.float32)
+            return np.frombuffer(buffer_copy, dtype=np.float32).copy()
+
+        with self.stream_buffer_lock:
+            buffer_copy = bytes(self.stream_buffer)
+        if not buffer_copy:
+            return np.array([], dtype=np.float32)
+        return self._pcm16_bytes_to_float32(buffer_copy)
+
+    def stop_stream_recording(self):
+        """Stop streaming capture and return the final buffered audio."""
+        self.stop_recording()
+        if self.recording_process and self.recording_process.poll() is None:
+            self.recording_process.send_signal(signal.SIGINT)
+            _, stderr = self.recording_process.communicate(timeout=5)
+            self.recording_stderr = stderr.strip()
+        elif self.recording_process:
+            _, stderr = self.recording_process.communicate(timeout=5)
+            self.recording_stderr = stderr.strip()
+
+        if self.stream_reader_thread and self.stream_reader_thread.is_alive():
+            self.stream_reader_thread.join(timeout=5)
+
+        if self.recording_process and self.recording_process.returncode not in (0, -2, -15):
+            logger.warning(
+                "Streaming recorder exited with code %s%s",
+                self.recording_process.returncode,
+                f": {self.recording_stderr}" if self.recording_stderr else "",
+            )
+
+        self.recording_process = None
+        self.stream_reader_thread = None
+        final_audio = self.get_recording_snapshot()
+        self.audio_data = final_audio
+        if final_audio is not None and len(final_audio) > 0:
+            logger.info(f"Recording complete. Duration: {len(final_audio) / self.sample_rate:.2f}s")
+        return final_audio
 
     def record_audio(self, duration=None, threshold=0.02, silence_duration=0.5):
         """
@@ -149,6 +217,143 @@ class AudioHandler:
         except Exception as e:
             logger.error(f"Recording error: {e}")
             return None
+
+    def _start_pw_record_stream(self):
+        """Start PipeWire recording to stdout for streaming STT."""
+        logger.info(f"Recording audio via pw-record (sample_rate: {self.sample_rate}Hz)...")
+        cmd = [
+            "pw-record",
+            "--media-category",
+            "Capture",
+            "--media-role",
+            "Communication",
+            "--rate",
+            str(self.sample_rate),
+            "--channels",
+            "1",
+            "--format",
+            "s16",
+            "-",
+        ]
+        self.recording_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self.stream_reader_thread = threading.Thread(
+            target=self._read_pcm_process_stream,
+            daemon=True,
+        )
+        self.stream_reader_thread.start()
+
+    def _start_arecord_stream(self):
+        """Start arecord to stdout for streaming STT."""
+        logger.info(f"Recording audio via arecord (sample_rate: {self.sample_rate}Hz)...")
+        cmd = [
+            "arecord",
+            "-q",
+            "-f",
+            "S16_LE",
+            "-r",
+            str(self.sample_rate),
+            "-c",
+            "1",
+            "-t",
+            "raw",
+            "-",
+        ]
+        self.recording_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self.stream_reader_thread = threading.Thread(
+            target=self._read_pcm_process_stream,
+            daemon=True,
+        )
+        self.stream_reader_thread.start()
+
+    def _read_pcm_process_stream(self):
+        """Read raw 16-bit PCM bytes from an audio subprocess."""
+        if not self.recording_process or not self.recording_process.stdout:
+            return
+
+        try:
+            while self.is_recording:
+                chunk = self.recording_process.stdout.read(4096)
+                if not chunk:
+                    break
+                with self.stream_buffer_lock:
+                    self.stream_buffer.extend(chunk)
+        except Exception as e:
+            logger.error(f"Streaming process read error: {e}")
+
+    def _start_sounddevice_stream(self):
+        """Start live recording with sounddevice and store float32 bytes."""
+        logger.info(f"Recording audio (sample_rate: {self.sample_rate}Hz)...")
+        self.stream_reader_thread = threading.Thread(
+            target=self._sounddevice_capture_loop,
+            daemon=True,
+        )
+        self.stream_reader_thread.start()
+
+    def _sounddevice_capture_loop(self):
+        """Capture float32 chunks from sounddevice."""
+        try:
+            chunk_size = int(self.sample_rate * 0.1)
+            with sd.InputStream(
+                channels=1,
+                samplerate=self.sample_rate,
+                blocksize=chunk_size,
+                dtype=np.float32,
+            ) as stream:
+                while self.is_recording:
+                    data, _ = stream.read(chunk_size)
+                    chunk = np.asarray(data, dtype=np.float32).reshape(-1)
+                    with self.stream_buffer_lock:
+                        self.stream_buffer.extend(chunk.tobytes())
+        except Exception as e:
+            logger.error(f"Sounddevice streaming error: {e}")
+
+    def _start_mock_stream(self):
+        """Start synthetic streaming audio generation for development."""
+        logger.info("MOCK: Simulating streaming audio recording...")
+        self.stream_reader_thread = threading.Thread(
+            target=self._mock_stream_loop,
+            daemon=True,
+        )
+        self.stream_reader_thread.start()
+
+    def _mock_stream_loop(self):
+        """Generate synthetic float32 chunks while recording."""
+        chunk_duration = 0.1
+        chunk_samples = int(self.sample_rate * chunk_duration)
+        frequency = 440
+        try:
+            while self.is_recording:
+                t = np.linspace(0, chunk_duration, chunk_samples, endpoint=False)
+                sine_wave = np.sin(2 * np.pi * frequency * t) * 0.3
+                noise = np.random.normal(0, 0.05, chunk_samples)
+                chunk = (sine_wave + noise).astype(np.float32)
+                with self.stream_buffer_lock:
+                    self.stream_buffer.extend(chunk.tobytes())
+                time.sleep(chunk_duration * 0.5)
+        except Exception as e:
+            logger.error(f"Mock streaming error: {e}")
+
+    def _pcm16_bytes_to_float32(self, raw_bytes):
+        """Convert little-endian 16-bit PCM bytes to float32 mono audio."""
+        if not raw_bytes:
+            return np.array([], dtype=np.float32)
+
+        usable_length = len(raw_bytes) - (len(raw_bytes) % 2)
+        if usable_length <= 0:
+            return np.array([], dtype=np.float32)
+
+        pcm = np.frombuffer(raw_bytes[:usable_length], dtype="<i2").astype(np.float32)
+        return pcm / 32768.0
 
     def _record_audio_pw_record(self, duration=None):
         """Record audio using PipeWire's pw-record command."""

@@ -78,6 +78,11 @@ class Config:
         return {
             "model": self.config.get("offline", {}).get("whisper_model", "base"),
             "device": self.config.get("offline", {}).get("whisper_device", "cpu"),
+            "compute_type": self.config.get("offline", {}).get("whisper_compute_type", "int8"),
+            "cpu_threads": self.config.get("offline", {}).get("whisper_cpu_threads", 0),
+            "num_workers": self.config.get("offline", {}).get("whisper_num_workers", 1),
+            "beam_size": self.config.get("offline", {}).get("whisper_beam_size", 1),
+            "vad_filter": self.config.get("offline", {}).get("whisper_vad_filter", True),
         }
 
     def get_m2m_model(self):

@@ -23,7 +23,7 @@ A push-to-talk offline translator application designed for testing and developme
 ```
 Audio Input (Microphone)
     ↓
-[STT] Speech-to-Text (Whisper)
+[STT] Speech-to-Text (faster-whisper)
     ↓
 [Detect Language]
     ↓
@@ -130,6 +130,7 @@ offline:
   # For laptop: use 'base' or 'small'
   # For Pi: will use 'tiny'
   whisper_model: base
+  whisper_compute_type: int8
 
   # Translation model (lightweight option)
   m2m_model: facebook/m2m100_418M
@@ -156,7 +157,7 @@ cloud:
 ## Performance
 
 Expected timing on modern laptop:
-- STT (10 seconds audio): 2-3 seconds
+- STT (10 seconds audio): 1-3 seconds depending on CPU and model cache
 - Translation (20 words): 1-2 seconds
 - TTS (20 words): 2-3 seconds
 - **Total E2E**: 5-8 seconds

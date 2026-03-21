@@ -54,6 +54,83 @@ class RecordingWorker(QThread):
             self.finished.emit()
 
 
+class StreamingSTTWorker(QThread):
+    """Worker thread for near-real-time STT updates while recording."""
+
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+    progress = pyqtSignal(str)
+    partial_ready = pyqtSignal(str)
+    final_ready = pyqtSignal(str, str)
+
+    def __init__(self, audio_handler, stt_service, source_lang, source_lang_code, max_duration: int):
+        super().__init__()
+        self.audio_handler = audio_handler
+        self.stt_service = stt_service
+        self.source_lang = source_lang
+        self.source_lang_code = source_lang_code
+        self.max_duration = max_duration
+        self.stop_requested = False
+        self.partial_interval = 1.0
+        self.min_audio_seconds = 0.75
+        self.last_partial = ""
+        self.last_processed_samples = 0
+
+    def stop(self):
+        """Request the streaming loop to stop."""
+        self.stop_requested = True
+        self.audio_handler.stop_recording()
+
+    def run(self):
+        """Capture audio and emit partial transcripts while recording."""
+        start_time = time.time()
+        final_audio = None
+
+        try:
+            self.progress.emit(f"Listening for {self.source_lang}...")
+            self.audio_handler.start_stream_recording()
+
+            while not self.stop_requested:
+                if time.time() - start_time >= self.max_duration:
+                    self.progress.emit("Max recording duration reached")
+                    break
+
+                time.sleep(self.partial_interval)
+                snapshot = self.audio_handler.get_recording_snapshot()
+                if snapshot is None:
+                    continue
+                if len(snapshot) < int(self.min_audio_seconds * self.audio_handler.sample_rate):
+                    continue
+                if len(snapshot) - self.last_processed_samples < int(0.5 * self.audio_handler.sample_rate):
+                    continue
+
+                text, _, _ = self.stt_service.transcribe(snapshot, language=self.source_lang_code)
+                self.last_processed_samples = len(snapshot)
+                if text and text != self.last_partial:
+                    self.last_partial = text
+                    self.partial_ready.emit(text)
+
+            final_audio = self.audio_handler.stop_stream_recording()
+            if final_audio is None or len(final_audio) == 0:
+                self.error.emit("Failed to capture audio. Try again.")
+                return
+
+            self.progress.emit("Finalizing transcription...")
+            final_text, _, _ = self.stt_service.transcribe(final_audio, language=self.source_lang_code)
+            if not final_text:
+                self.error.emit("Failed to recognize speech. Try again.")
+                return
+
+            self.final_ready.emit(final_text, f"{time.time() - start_time:.2f}s")
+
+        except Exception as e:
+            logger.error(f"Streaming STT error: {e}")
+            self.error.emit(f"Error: {str(e)}")
+        finally:
+            self.audio_handler.stop_recording()
+            self.finished.emit()
+
+
 class TranslationWorker(QThread):
     """Worker thread for running translation pipeline"""
 
@@ -190,7 +267,9 @@ class MainWindow(QMainWindow):
         # State
         self.is_recording = False
         self.is_processing = False
+        self.is_streaming = False
         self.recording_thread = None
+        self.streaming_stt_worker = None
         self.worker_thread = None
 
         # UI Setup
@@ -343,11 +422,16 @@ class MainWindow(QMainWindow):
 
     def _on_ptt_pressed(self, event):
         """Handle PTT button press"""
-        if self.is_recording or self.is_processing:
+        if self.is_recording or self.is_processing or self.is_streaming:
+            return
+
+        if not self._ensure_pipeline_services():
             return
 
         self.is_recording = True
         self.audio_handler.is_recording = True
+        self.source_text.clear()
+        self.translated_text.setText("Streaming STT active...")
         self.ptt_button.setText("🎙️  RECORDING...  🔊")
         self.ptt_button.setStyleSheet(
             """
@@ -363,6 +447,26 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage("Recording...")
         self._log("Recording audio...")
+        self.status_label.setText("Listening...")
+
+        if self.stt_only_mode:
+            source_lang, _ = self.language_service.get_current_pair()
+            source_lang_code = self.language_service.get_language_code(source_lang)
+            self.is_streaming = True
+            self.streaming_stt_worker = StreamingSTTWorker(
+                self.audio_handler,
+                self.stt_service,
+                source_lang,
+                source_lang_code,
+                self.audio_config.get("max_duration", 10),
+            )
+            self.streaming_stt_worker.progress.connect(self._on_progress)
+            self.streaming_stt_worker.partial_ready.connect(self._on_partial_stt_ready)
+            self.streaming_stt_worker.final_ready.connect(self._on_final_stt_ready)
+            self.streaming_stt_worker.error.connect(self._on_error)
+            self.streaming_stt_worker.finished.connect(self._on_streaming_stt_finished)
+            self.streaming_stt_worker.start()
+            return
 
         self.recording_thread = RecordingWorker(
             self.audio_handler,
@@ -378,9 +482,11 @@ class MainWindow(QMainWindow):
             return
 
         self.audio_handler.stop_recording()
-        self.ptt_button.setText("⏳  PROCESSING...  🔊")
+        self.ptt_button.setText("⏳  FINALIZING...  🔊")
         self.statusBar().showMessage("Stopping recording...")
         self.ptt_button.setEnabled(False)
+        if self.streaming_stt_worker is not None:
+            self.streaming_stt_worker.stop()
 
     def _reset_ptt_button(self):
         """Restore the default push-to-talk button style."""
@@ -460,6 +566,17 @@ class MainWindow(QMainWindow):
         self._log(message)
         self.statusBar().showMessage(message)
 
+    def _on_partial_stt_ready(self, text: str):
+        """Show partial STT output while the user is still speaking."""
+        self.source_text.setText(text)
+        self.translated_text.setText("Streaming STT active...")
+
+    def _on_final_stt_ready(self, text: str, elapsed: str):
+        """Handle the finalized streaming STT result."""
+        self.source_text.setText(text)
+        self.translated_text.setText("STT-only mode: translation skipped")
+        self._log(f"✓ STT complete in {elapsed}")
+
     def _on_error(self, error: str):
         """Handle errors"""
         self._log(f"ERROR: {error}")
@@ -477,6 +594,14 @@ class MainWindow(QMainWindow):
         self.ptt_button.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.status_label.setText("STT Ready" if self.stt_only_mode else "GUI Ready")
+
+    def _on_streaming_stt_finished(self):
+        """Handle when streaming STT stops."""
+        self.is_streaming = False
+        self._reset_ptt_button()
+        self.ptt_button.setEnabled(True)
+        self.status_label.setText("STT Ready")
+        self.streaming_stt_worker = None
 
     def _on_prev_language(self):
         """Switch to previous language pair"""
@@ -582,6 +707,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Handle application close"""
         logger.info("Shutting down...")
+        if self.streaming_stt_worker is not None:
+            self.streaming_stt_worker.stop()
         self.connectivity_service.stop_monitoring()
         if self.tts_service is not None:
             self.tts_service.shutdown()

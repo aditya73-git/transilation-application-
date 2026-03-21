@@ -33,6 +33,11 @@ offline:
   # For Pi: use tiny
   whisper_model: base
   whisper_device: cpu  # cpu or cuda
+  whisper_compute_type: int8  # int8 is a good default for CPU / Raspberry Pi
+  whisper_cpu_threads: 0      # 0 = let runtime choose
+  whisper_num_workers: 1
+  whisper_beam_size: 1        # lower beam size for faster prototype latency
+  whisper_vad_filter: true
 
   # M2M-100 translation model
   # 418M is lightweight but good quality
