@@ -47,30 +47,40 @@ class STTService:
         "sk",
     }
 
-    def __init__(self):
+    def __init__(
+        self,
+        device: Optional[str] = None,
+        compute_type: Optional[str] = None,
+        model_name: Optional[str] = None,
+        cpu_threads: Optional[int] = None,
+        num_workers: Optional[int] = None,
+        beam_size: Optional[int] = None,
+        vad_filter: Optional[bool] = None,
+    ):
         """Initialize STT service with faster-whisper model."""
         config = get_config()
         self.config = config.get_whisper_model()
         self.model = None
-        self.device = self.config.get("device", "cpu")
-        self.compute_type = self.config.get("compute_type", "int8")
-        self.cpu_threads = self.config.get("cpu_threads", 0)
-        self.num_workers = self.config.get("num_workers", 1)
-        self.beam_size = self.config.get("beam_size", 1)
-        self.vad_filter = self.config.get("vad_filter", True)
+        self.model_name = model_name or self.config.get("model", "base")
+        self.device = device or self.config.get("device", "cpu")
+        self.compute_type = compute_type or self.config.get("compute_type", "int8")
+        self.cpu_threads = self.config.get("cpu_threads", 0) if cpu_threads is None else cpu_threads
+        self.num_workers = self.config.get("num_workers", 1) if num_workers is None else num_workers
+        self.beam_size = self.config.get("beam_size", 1) if beam_size is None else beam_size
+        self.vad_filter = self.config.get("vad_filter", True) if vad_filter is None else vad_filter
         self._load_model()
 
     def _load_model(self):
         """Load the faster-whisper model."""
         try:
-            repo_id = resolve_whisper_repo_id(self.config["model"])
+            repo_id = resolve_whisper_repo_id(self.model_name)
             model_path = get_cached_snapshot_path(repo_id)
             if model_path is None:
                 model_path = ensure_required_assets(get_config(), local_files_only=True)[repo_id]
 
             logger.info(
                 "Loading faster-whisper model: %s (device=%s, compute_type=%s)",
-                self.config["model"],
+                self.model_name,
                 self.device,
                 self.compute_type,
             )
@@ -180,12 +190,14 @@ class STTService:
         """Get list of supported languages"""
         return sorted(self.SUPPORTED_LANGUAGES)
 
-    def set_device(self, device: str):
-        """Change device (cpu or cuda) and reload the model."""
+    def set_device(self, device: str, compute_type: Optional[str] = None):
+        """Change device and reload the model."""
         self.device = device
+        if compute_type is not None:
+            self.compute_type = compute_type
         self.unload_model()
         self._load_model()
-        logger.info(f"Model reloaded on {device}")
+        logger.info("Model reloaded on %s (%s)", device, self.compute_type)
 
     def unload_model(self):
         """Unload model to free memory."""
@@ -198,9 +210,20 @@ class STTService:
 _stt_instance = None
 
 
-def get_stt_service() -> STTService:
+def get_stt_service(
+    device: Optional[str] = None,
+    compute_type: Optional[str] = None,
+    force_reload: bool = False,
+) -> STTService:
     """Get global STT service instance"""
     global _stt_instance
-    if _stt_instance is None:
-        _stt_instance = STTService()
+    if (
+        _stt_instance is None
+        or force_reload
+        or (device is not None and _stt_instance.device != device)
+        or (compute_type is not None and _stt_instance.compute_type != compute_type)
+    ):
+        if _stt_instance is not None:
+            _stt_instance.unload_model()
+        _stt_instance = STTService(device=device, compute_type=compute_type)
     return _stt_instance

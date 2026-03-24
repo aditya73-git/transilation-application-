@@ -1,6 +1,7 @@
 """Translation service using lighter Marian/OPUS models with English pivoting."""
 from collections import OrderedDict
 import gc
+import threading
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -26,6 +27,7 @@ class TranslationService:
         self.max_loaded_models = max(1, int(self.config.get("max_loaded_models", 2)))
         self.model_specs = self.config.get("models", {})
         self.loaded_pipelines = OrderedDict()
+        self._load_lock = threading.RLock()
 
     def _normalize_language(self, language: str) -> str:
         """Normalize a language name from the GUI."""
@@ -39,36 +41,75 @@ class TranslationService:
 
     def _load_pipeline(self, model_name: str):
         """Load or reuse a translation pipeline."""
-        if model_name in self.loaded_pipelines:
-            tokenizer, model = self.loaded_pipelines.pop(model_name)
+        with self._load_lock:
+            if model_name in self.loaded_pipelines:
+                tokenizer, model = self.loaded_pipelines.pop(model_name)
+                self.loaded_pipelines[model_name] = (tokenizer, model)
+                return tokenizer, model
+
+            logger.info("Loading translation model: %s", model_name)
+            local_model_path = get_cached_snapshot_path(model_name)
+            if local_model_path is None:
+                local_model_path = ensure_required_assets(get_config(), local_files_only=True)[model_name]
+
+            tokenizer = AutoTokenizer.from_pretrained(local_model_path, local_files_only=True)
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                local_model_path,
+                local_files_only=True,
+                use_safetensors=False,
+            )
+            model = model.to(self.device)
+            model.eval()
             self.loaded_pipelines[model_name] = (tokenizer, model)
+
+            while len(self.loaded_pipelines) > self.max_loaded_models:
+                old_model_name, (_, old_model) = self.loaded_pipelines.popitem(last=False)
+                logger.info("Unloading translation model: %s", old_model_name)
+                del old_model
+                gc.collect()
+                if self.device.startswith("cuda") and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            logger.info("Translation model ready on %s", self.device)
             return tokenizer, model
 
-        logger.info("Loading translation model: %s", model_name)
-        local_model_path = get_cached_snapshot_path(model_name)
-        if local_model_path is None:
-            local_model_path = ensure_required_assets(get_config(), local_files_only=True)[model_name]
+    def get_route_model_names(self, source_lang: str, target_lang: str) -> list[str]:
+        """Return the direct or pivot model ids needed for one pair."""
+        source_lang = self._normalize_language(source_lang)
+        target_lang = self._normalize_language(target_lang)
 
-        tokenizer = AutoTokenizer.from_pretrained(local_model_path, local_files_only=True)
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            local_model_path,
-            local_files_only=True,
-            use_safetensors=False,
+        if source_lang == target_lang:
+            return []
+
+        direct = self._get_model_spec(source_lang, target_lang)
+        if direct is not None:
+            return [direct["model"]]
+
+        if self.strategy != "pivot_english":
+            raise ValueError(f"No direct translation route configured for {source_lang} -> {target_lang}")
+
+        source_to_pivot = self._get_model_spec(source_lang, self.pivot_language)
+        pivot_to_target = self._get_model_spec(self.pivot_language, target_lang)
+        if source_to_pivot is None:
+            raise ValueError(f"No offline route configured for {source_lang} -> {self.pivot_language}")
+        if pivot_to_target is None:
+            raise ValueError(f"No offline route configured for {self.pivot_language} -> {target_lang}")
+
+        return [source_to_pivot["model"], pivot_to_target["model"]]
+
+    def warm_pair(self, source_lang: str, target_lang: str):
+        """Preload the direct or pivot models for a selected pair."""
+        model_names = self.get_route_model_names(source_lang, target_lang)
+        if not model_names:
+            return
+        logger.info(
+            "Warming translation route for %s -> %s using %s",
+            source_lang,
+            target_lang,
+            ", ".join(model_names),
         )
-        model = model.to(self.device)
-        model.eval()
-        self.loaded_pipelines[model_name] = (tokenizer, model)
-
-        while len(self.loaded_pipelines) > self.max_loaded_models:
-            old_model_name, (_, old_model) = self.loaded_pipelines.popitem(last=False)
-            logger.info("Unloading translation model: %s", old_model_name)
-            del old_model
-            gc.collect()
-            if self.device.startswith("cuda") and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        logger.info("Translation model ready on %s", self.device)
-        return tokenizer, model
+        for model_name in model_names:
+            self._load_pipeline(model_name)
 
     def _translate_direct(self, text: str, source_lang: str, target_lang: str) -> str:
         """Translate a single hop using a configured pair model."""

@@ -60,6 +60,49 @@ class Config:
 
         return value
 
+    def set(self, key, value, persist: bool = False):
+        """Set a configuration value using dot notation."""
+        keys = key.split(".")
+        target = self.config
+
+        for part in keys[:-1]:
+            next_value = target.get(part)
+            if not isinstance(next_value, dict):
+                next_value = {}
+                target[part] = next_value
+            target = next_value
+
+        target[keys[-1]] = value
+
+        if persist:
+            self._persist_values({key: value})
+
+    def update(self, updates: dict, persist: bool = False):
+        """Update multiple configuration values using dot notation."""
+        for key, value in updates.items():
+            self.set(key, value, persist=False)
+        if persist and updates:
+            self._persist_values(updates)
+
+    def _persist_values(self, updates: dict):
+        """Persist selected values back to the YAML file while preserving unrelated config."""
+        with open(self.config_path, "r") as f:
+            raw_config = yaml.safe_load(f) or {}
+
+        for key, value in updates.items():
+            keys = key.split(".")
+            target = raw_config
+            for part in keys[:-1]:
+                next_value = target.get(part)
+                if not isinstance(next_value, dict):
+                    next_value = {}
+                    target[part] = next_value
+                target = next_value
+            target[keys[-1]] = value
+
+        with open(self.config_path, "w") as f:
+            yaml.safe_dump(raw_config, f, sort_keys=False, allow_unicode=True)
+
     def get_languages(self):
         """Get list of supported languages"""
         return self.config.get("languages", {}).get("supported", [])
@@ -79,6 +122,7 @@ class Config:
             "model": self.config.get("offline", {}).get("whisper_model", "base"),
             "device": self.config.get("offline", {}).get("whisper_device", "cpu"),
             "compute_type": self.config.get("offline", {}).get("whisper_compute_type", "int8"),
+            "gpu_compute_type": self.config.get("offline", {}).get("whisper_gpu_compute_type", "float16"),
             "cpu_threads": self.config.get("offline", {}).get("whisper_cpu_threads", 0),
             "num_workers": self.config.get("offline", {}).get("whisper_num_workers", 1),
             "beam_size": self.config.get("offline", {}).get("whisper_beam_size", 1),

@@ -1,250 +1,137 @@
-# Offline Translator - Desktop GUI Version
+# Offline Translator (desktop GUI)
 
-A push-to-talk offline translator application designed for testing and development before deployment on Raspberry Pi hardware.
+Push-to-talk offline translator: **faster-whisper** (STT) → **Helsinki-NLP Marian/OPUS** models (translation) → **Piper** (TTS). Designed for laptops and Raspberry Pi–class hardware.
 
 ## Features
 
-- 🎙️ Push-to-talk interface (GUI button replaces physical button)
-- 🌐 7 supported language pairs:
-  - English ↔ German
-  - English ↔ Arabic
-  - English ↔ Romanian
-  - English ↔ Slovakian
-  - English ↔ Turkish
-  - English ↔ Polish
-- 📴 Fully offline translation (no internet required)
-- ☁️ Optional cloud refinement for better quality translations
-- 💾 Translation caching for repeated phrases
-- 🔊 Text-to-speech output
-- ⚙️ Configurable models and settings
+- Push-to-talk PyQt5 GUI
+- Offline STT, translation, and TTS (no cloud required for core pipeline)
+- Optional Claude API refinement when online (`src/config.yaml` + `.env`)
+- Translation cache (SQLite) and configurable models in `src/config.yaml`
 
-## Architecture
+## Requirements
 
-```
-Audio Input (Microphone)
-    ↓
-[STT] Speech-to-Text (faster-whisper)
-    ↓
-[Detect Language]
-    ↓
-[Translation] M2M-100
-    ↓
-[TTS] Text-to-Speech
-    ↓
-Audio Output (Speakers)
-    ↓
-[Optional] Cloud Refinement (Background)
+| Resource | Guidance |
+|----------|----------|
+| **Python** | 3.9 or newer |
+| **RAM** | ~4 GB minimum for `whisper_model: tiny`; **8 GB** recommended for `base` + Marian + Piper |
+| **Disk** | Several GB for Hugging Face caches and Piper voices (see startup preflight) |
+| **Display** | Graphical session for the GUI (`python -m src.main`) |
+| **Audio** | Microphone + speakers; on Linux, PipeWire (`pw-record` / `pw-play`) or PortAudio (`sounddevice`) |
+
+## Install on a new machine (from scratch)
+
+### 1. Get the code
+
+```bash
+git clone <your-repo-url> transilation-application
+cd transilation-application
 ```
 
-## Installation
+(Or unpack a ZIP and `cd` into the project folder.)
 
-### Prerequisites
-- Python 3.9+
-- 8GB+ RAM (for comfortable model loading)
-- Audio devices (microphone and speakers)
+### 2. System packages (Linux)
 
-### Setup
+Install build/audio helpers so `sounddevice` and PyTorch-friendly wheels resolve cleanly:
 
-1. **Clone or navigate to the project directory**
-   ```bash
-   cd /path/to/offline-translator
-   ```
+**Debian / Ubuntu / Raspberry Pi OS**
 
-2. **Create virtual environment** (if not already done)
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-   ```
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-dev build-essential \
+  libportaudio2 portaudio19-dev libsndfile1
+```
 
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
+For the same audio path the app often uses on desktop Linux (PipeWire):
 
-4. **Set up environment variables**
-   ```bash
-   cp src/.env.example .env
-   # Edit .env and add your API keys (optional)
-   ```
+```bash
+sudo apt install -y pipewire pipewire-audio-client-libraries
+```
 
-5. **Configure settings** (optional)
-   Edit `src/config.yaml` to customize:
-   - Model sizes (for faster/slower hardware)
-   - Language pairs
-   - Audio settings
-   - Cloud API keys
+Optional: `ffmpeg` is useful for general audio tooling; faster-whisper does not require it for basic use.
 
-## Usage
+### 3. Python virtual environment
 
-### Run the GUI Application
+```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 4. Environment file (optional)
+
+Used for API keys referenced in `src/config.yaml` (cloud refinement, etc.):
+
+```bash
+cp src/.env.example .env
+# Edit .env if you enable cloud features
+```
+
+### 5. Configuration
+
+- Main settings: **`src/config.yaml`** (Whisper size, language pairs, Piper paths, cache, cloud flags).
+- First launch with **`models.auto_download: true`** (default) will download STT/translation assets via Hugging Face when online; Piper voice files are validated/downloaded per your preflight settings.
+
+### 6. Run the application
+
+From the project root, with the venv activated:
+
 ```bash
 python -m src.main
 ```
 
-This will:
-1. Load language models (first run takes 2-3 minutes)
-2. Initialize audio system
-3. Open the GUI window
-4. Await button presses
+On first run, startup **preflight** may take several minutes while models are cached. Later starts are faster.
 
-### Using the Application
+### 7. Optional: verify the pipeline without the GUI
 
-1. **Start Application** → Models load and display "Ready"
-2. **Click "Press to Talk" Button** → Start recording
-3. **Release Button** → Processing begins:
-   - Speech-to-text (2-3 seconds)
-   - Translation (1-2 seconds)
-   - Text-to-speech (2-3 seconds)
-   - Audio plays through speakers
-4. **Switch Languages** ← Click/→ Buttons → Cycle through language pairs
-
-### GUI Layout
-
-```
-┌─────────────────────────────────────────┐
-│  🎤 OFFLINE TRANSLATOR - Desktop v0.1   │
-├─────────────────────────────────────────┤
-│  Status: Ready | 🟢 Offline | EN→DE     │
-├─────────────────────────────────────────┤
-│  SOURCE TEXT:                           │
-│  [Recognized speech]                    │
-│                                         │
-│  TRANSLATED OUTPUT:                     │
-│  [Translation result]                   │
-├─────────────────────────────────────────┤
-│        [Press to Talk]                  │
-│  [← >>] Language Pair [>> →]            │
-│        [Settings]                       │
-├─────────────────────────────────────────┤
-│  Log: Ready...                          │
-└─────────────────────────────────────────┘
+```bash
+python test_pipeline.py
 ```
 
-## Configuration
+## How it works (high level)
 
-Edit `src/config.yaml` to customize:
-
-### Model Selection
-```yaml
-offline:
-  # For laptop: use 'base' or 'small'
-  # For Pi: will use 'tiny'
-  whisper_model: base
-  whisper_compute_type: int8
-
-  # Translation model (lightweight option)
-  m2m_model: facebook/m2m100_418M
-
-  # TTS engine
-  tts_engine: pyttsx3
 ```
-
-### Audio Settings
-```yaml
-audio:
-  sample_rate: 16000  # Whisper requirement
-  channels: 1         # Mono
-  max_duration: 30    # Max recording time
+Microphone → STT (faster-whisper) → Translation (Marian/OPUS, pivot via English if needed)
+    → TTS (Piper) → speakers
+         ↘ optional: Claude refinement (if enabled + API key)
 ```
-
-### Cloud Integration
-```yaml
-cloud:
-  enabled: false      # Set to true to enable Claude refinements
-  use_refinement: false  # Background translation improvement
-```
-
-## Performance
-
-Expected timing on modern laptop:
-- STT (10 seconds audio): 1-3 seconds depending on CPU and model cache
-- Translation (20 words): 1-2 seconds
-- TTS (20 words): 2-3 seconds
-- **Total E2E**: 5-8 seconds
 
 ## Troubleshooting
 
-### Models won't download
-- Check internet connection
-- Set `HF_HOME` environment variable to custom cache location
-- Models (~3GB total) require significant disk space
+| Issue | What to try |
+|-------|-------------|
+| **Imports / missing wheels** | Ensure Python 3.9+, upgraded `pip`, and on Linux the `apt` packages above. |
+| **PyQt5 / display** | Run under a desktop session; for SSH use X11 forwarding or run on the device console. |
+| **Microphone** | Check PipeWire/PulseAudio; if `pw-record` is missing, install PipeWire packages or rely on `sounddevice` + PortAudio. |
+| **Piper not found** | `piper` should be on `PATH` (venv’s `bin` after `pip install piper-tts`). Voice `.onnx` paths must match `src/config.yaml`. |
+| **Hugging Face / downloads** | First run needs network; set `HF_HOME` in `.env` to move the cache. |
+| **RAM / swap** | In `src/config.yaml`, reduce `whisper_model` (e.g. `tiny`), lower `translation_max_loaded_models`, or disable heavy pairs. |
 
-### Microphone not detected
-- Check audio settings in system preferences
-- Run `sounddevice` test to list devices
-- Select correct device in GUI settings
-
-### High latency
-- Reduce model size in config (tiny → base)
-- Use GPU if available (cuda in config)
-- Close other applications to free RAM
-
-### Poor translation quality
-- Enable cloud refinement if online
-- This model trade-off is expected for offline-only operation
-
-## Project Structure
+## Project layout (important paths)
 
 ```
 src/
-├── main.py                      # Application entry point
-├── config.py                    # Configuration loader
-├── config.yaml                  # Configuration file
-│
-├── services/
-│   ├── stt_service.py          # Speech-to-text
-│   ├── translation_service.py  # Translation
-│   ├── tts_service.py          # Text-to-speech
-│   ├── language_service.py     # Language management
-│   └── connectivity_service.py # Internet detection
-│
-├── ui/
-│   ├── main_window.py          # Main GUI window
-│   ├── components.py           # Reusable widgets
-│   └── styles.qss              # Stylesheet
-│
-├── utils/
-│   ├── logger.py               # Logging setup
-│   ├── cache.py                # Translation cache
-│   └── audio_handler.py        # Audio I/O
-│
-└── cloud/
-    └── claude_client.py        # Claude API client
+  main.py              # Entry point
+  config.py            # Loads config.yaml + .env
+  config.yaml          # Models, audio, cloud, UI
+  services/            # STT, translation, TTS, languages, connectivity
+  ui/main_window.py    # GUI
+  utils/               # Audio, cache, logging, performance, Pi check
+  startup_preflight.py # Offline asset checks / downloads
+logs/                  # Application logs
 ```
 
-## Next Steps - Pi Deployment
+## Development
 
-When moving to Raspberry Pi:
-1. Switch to quantized models (`tiny-int8`, `418M-int8`)
-2. Remove PyQt5 GUI → Use CLI or buttons
-3. Add GPIO button handling
-4. Integrate with system audio (USB soundcard)
-5. Create systemd service for auto-start
-6. Optimize for power consumption
+Install in editable mode (optional):
 
-## Development Notes
+```bash
+pip install -e .
+```
 
-- **Models are cached** in `./models/` after first download
-- **Translations cached** in SQLite database (`cache.db`)
-- **Logs stored** in `./logs/` directory
-- **Thread-safe** design for async cloud refinement
+Console script (if configured in `setup.py`): `translator` → `src.main:main`.
 
 ## License
 
 MIT License
-
-## Contributing
-
-Pull requests welcome!
-
-## Support
-
-For issues or questions, check:
-1. Configuration in `src/config.yaml`
-2. Logs in `logs/` directory
-3. GitHub issues
-
----
-
-**Status**: Alpha (Desktop testing phase)
-**Target**: Raspberry Pi 4/5 with bone-conduction earpiece

@@ -1,4 +1,5 @@
 """Main GUI window for the offline translator"""
+import re
 import sys
 import time
 from PyQt5.QtWidgets import (
@@ -11,12 +12,20 @@ from PyQt5.QtWidgets import (
     QTextEdit,
     QStatusBar,
     QProgressBar,
+    QComboBox,
+    QDialog,
+    QFormLayout,
+    QDialogButtonBox,
+    QCheckBox,
+    QSpinBox,
+    QDoubleSpinBox,
+    QMessageBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt5.QtGui import QFont, QColor, QIcon
 from pathlib import Path
 
-from src.services.stt_service import get_stt_service
+from src.services.stt_service import STTService, get_stt_service
 from src.services.translation_service import get_translation_service
 from src.services.tts_service import get_tts_service
 from src.services.language_service import get_language_service
@@ -29,6 +38,109 @@ from src.config import get_config
 from src.cloud.claude_client import get_claude_client
 
 logger = get_logger(__name__)
+
+
+def _tokenize_words(text: str):
+    """Split text into whitespace-delimited tokens."""
+    return [word for word in text.strip().split() if word]
+
+
+def _join_words(words):
+    """Join tokens back into normalized text."""
+    return " ".join(words).strip()
+
+
+def _append_text(base: str, extra: str) -> str:
+    """Append text with a single separating space when needed."""
+    base = (base or "").strip()
+    extra = (extra or "").strip()
+    if not base:
+        return extra
+    if not extra:
+        return base
+    return f"{base} {extra}"
+
+
+def _normalize_token(token: str) -> str:
+    """Normalize a token for fuzzy overlap matching."""
+    return re.sub(r"(^\W+|\W+$)", "", token).lower()
+
+
+def _find_overlap_size(left_words, right_words) -> int:
+    """Find the largest suffix/prefix token overlap between two transcripts."""
+    max_overlap = min(len(left_words), len(right_words))
+    for size in range(max_overlap, 1, -1):
+        left_slice = [_normalize_token(token) for token in left_words[-size:]]
+        right_slice = [_normalize_token(token) for token in right_words[:size]]
+        if left_slice == right_slice:
+            return size
+    return 0
+
+
+def _split_committable_words(words, finalize: bool = False):
+    """Split a stable text region into committed words and leftover unstable tail."""
+    if not words:
+        return [], []
+
+    boundary_index = -1
+    for index, token in enumerate(words):
+        if token and token[-1] in ".?!;:":
+            boundary_index = index + 1
+
+    if boundary_index > 0:
+        return words[:boundary_index], words[boundary_index:]
+
+    if finalize:
+        return words, []
+
+    if len(words) >= 8:
+        keep_tail = 3
+        return words[:-keep_tail], words[-keep_tail:]
+
+    return [], words
+
+
+def _advance_incremental_transcript(pending_text: str, latest_text: str):
+    """Commit stable prefix words and keep only the unstable live tail."""
+    pending_words = _tokenize_words(pending_text)
+    latest_words = _tokenize_words(latest_text)
+
+    if not latest_words:
+        return "", pending_text
+    if not pending_words:
+        return "", _join_words(latest_words)
+
+    overlap = _find_overlap_size(pending_words, latest_words)
+    if overlap > 0:
+        stable_words = pending_words[:-overlap]
+        merged_pending = pending_words[-overlap:] + latest_words[overlap:]
+    else:
+        stable_words = []
+        merged_pending = latest_words
+
+    commit_words, leftover_words = _split_committable_words(stable_words, finalize=False)
+    next_pending = leftover_words + merged_pending
+    return _join_words(commit_words), _join_words(next_pending)
+
+
+def _finalize_incremental_transcript(pending_text: str, final_tail_text: str) -> str:
+    """Merge the last tail transcription into the pending transcript and finalize it."""
+    pending_words = _tokenize_words(pending_text)
+    final_words = _tokenize_words(final_tail_text)
+
+    if not pending_words:
+        return _join_words(final_words)
+    if not final_words:
+        return _join_words(pending_words)
+
+    overlap = _find_overlap_size(pending_words, final_words)
+    if overlap > 0:
+        merged_words = pending_words + final_words[overlap:]
+    else:
+        merged_words = pending_words + final_words
+
+    commit_words, leftover_words = _split_committable_words(merged_words, finalize=True)
+    return _join_words(commit_words + leftover_words)
 
 
 class RecordingWorker(QThread):
@@ -55,6 +167,145 @@ class RecordingWorker(QThread):
             self.work_finished.emit()
 
 
+class TranslationWarmupWorker(QThread):
+    """Warm the translation route for the currently selected pair."""
+
+    warmed = pyqtSignal(str, str)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, translation_service, source_lang: str, target_lang: str):
+        super().__init__()
+        self.translation_service = translation_service
+        self.source_lang = source_lang
+        self.target_lang = target_lang
+
+    def run(self):
+        """Load direct or pivot translation models in the background."""
+        try:
+            self.progress.emit(f"Warming translation route for {self.source_lang} -> {self.target_lang}...")
+            self.translation_service.warm_pair(self.source_lang, self.target_lang)
+            self.warmed.emit(self.source_lang, self.target_lang)
+        except Exception as e:
+            logger.error(f"Translation warmup error: {e}")
+            self.error.emit(f"Translation warmup failed: {str(e)}")
+
+
+class STTBenchmarkWorker(QThread):
+    """Benchmark the same captured audio on CPU and CUDA STT backends."""
+
+    work_finished = pyqtSignal()
+    progress = pyqtSignal(str)
+
+    def __init__(
+        self,
+        audio_data,
+        source_lang_code: str,
+        model_name: str,
+        active_device: str,
+        active_compute_type: str,
+        cpu_compute_type: str,
+        gpu_compute_type: str,
+        cpu_threads: int,
+        num_workers: int,
+        beam_size: int,
+        vad_filter: bool,
+    ):
+        super().__init__()
+        self.audio_data = audio_data
+        self.source_lang_code = source_lang_code
+        self.model_name = model_name
+        self.active_device = active_device
+        self.active_compute_type = active_compute_type
+        self.cpu_compute_type = cpu_compute_type
+        self.gpu_compute_type = gpu_compute_type
+        self.cpu_threads = cpu_threads
+        self.num_workers = num_workers
+        self.beam_size = beam_size
+        self.vad_filter = vad_filter
+
+    def run(self):
+        """Benchmark CPU and CUDA STT sequentially on the same audio."""
+        results = {
+            self.active_device: {
+                "wall_seconds": 0.0,
+                "self_cpu_seconds": 0.0,
+                "child_cpu_seconds": 0.0,
+                "total_cpu_seconds": 0.0,
+                "avg_cpu_percent": 0.0,
+                "current_rss_mib": 0.0,
+                "self_peak_rss_mib": 0.0,
+                "child_peak_rss_mib": 0.0,
+            }
+        }
+        target_devices = []
+        if self.active_device == "cuda":
+            target_devices.append(("cpu", self.cpu_compute_type))
+        elif self.active_device == "cpu":
+            target_devices.append(("cuda", self.gpu_compute_type))
+        else:
+            target_devices.extend((("cpu", self.cpu_compute_type), ("cuda", self.gpu_compute_type)))
+
+        for device, compute_type in target_devices:
+            service = None
+            try:
+                self.progress.emit(f"Benchmarking STT on {device} ({compute_type})...")
+                load_start = take_perf_sample()
+                service = STTService(
+                    device=device,
+                    compute_type=compute_type,
+                    model_name=self.model_name,
+                    cpu_threads=self.cpu_threads,
+                    num_workers=self.num_workers,
+                    beam_size=self.beam_size,
+                    vad_filter=self.vad_filter,
+                )
+                load_end = take_perf_sample()
+
+                transcribe_start = take_perf_sample()
+                text, detected_language, confidence = service.transcribe(
+                    self.audio_data,
+                    language=self.source_lang_code,
+                )
+                transcribe_end = take_perf_sample()
+
+                load_metrics = stage_metrics(load_start, load_end)
+                run_metrics = stage_metrics(transcribe_start, transcribe_end)
+                results[device] = run_metrics
+
+                self.progress.emit(format_stage_metrics(f"Benchmark STT {device} load", load_start, load_end))
+                self.progress.emit(
+                    format_stage_metrics(f"Benchmark STT {device}", transcribe_start, transcribe_end)
+                )
+                preview = text[:80] + ("..." if len(text) > 80 else "")
+                self.progress.emit(
+                    f"Benchmark | STT {device} result: lang={detected_language} conf={confidence:.2f} "
+                    f"text={preview}"
+                )
+                if load_metrics["wall_seconds"] > 0:
+                    self.progress.emit(
+                        f"Benchmark | STT {device} load summary: wall={load_metrics['wall_seconds']:.2f}s "
+                        f"peak={load_metrics['self_peak_rss_mib']:.1f}MiB"
+                    )
+            except Exception as e:
+                logger.warning("STT benchmark failed on %s: %s", device, e)
+                self.progress.emit(f"Benchmark | STT {device} unavailable: {e}")
+            finally:
+                if service is not None:
+                    service.unload_model()
+
+        cpu_metrics = results.get("cpu")
+        gpu_metrics = results.get("cuda")
+        if cpu_metrics and gpu_metrics and cpu_metrics["wall_seconds"] > 0 and gpu_metrics["wall_seconds"] > 0:
+            speedup = cpu_metrics["wall_seconds"] / gpu_metrics["wall_seconds"]
+            self.progress.emit(
+                f"Benchmark | STT cuda_vs_cpu speedup={speedup:.2f}x "
+                f"(cpu={cpu_metrics['wall_seconds']:.2f}s, cuda={gpu_metrics['wall_seconds']:.2f}s)"
+            )
+
+        self.work_finished.emit()
+
+
 class StreamingSTTWorker(QThread):
     """Worker thread for near-real-time STT updates while recording."""
 
@@ -64,7 +315,17 @@ class StreamingSTTWorker(QThread):
     partial_ready = pyqtSignal(str)
     final_ready = pyqtSignal(str, str)
 
-    def __init__(self, audio_handler, stt_service, source_lang, source_lang_code, max_duration: int):
+    def __init__(
+        self,
+        audio_handler,
+        stt_service,
+        source_lang,
+        source_lang_code,
+        max_duration: int,
+        partial_interval: float,
+        partial_step_seconds: float,
+        partial_window_seconds: float,
+    ):
         super().__init__()
         self.audio_handler = audio_handler
         self.stt_service = stt_service
@@ -72,9 +333,13 @@ class StreamingSTTWorker(QThread):
         self.source_lang_code = source_lang_code
         self.max_duration = max_duration
         self.stop_requested = False
-        self.partial_interval = 1.0
+        self.partial_interval = partial_interval
         self.min_audio_seconds = 0.75
-        self.last_partial = ""
+        self.partial_step_seconds = partial_step_seconds
+        self.partial_window_seconds = partial_window_seconds
+        self.committed_source_text = ""
+        self.pending_source_text = ""
+        self.last_display_text = ""
         self.last_processed_samples = 0
 
     def stop(self):
@@ -102,14 +367,27 @@ class StreamingSTTWorker(QThread):
                     continue
                 if len(snapshot) < int(self.min_audio_seconds * self.audio_handler.sample_rate):
                     continue
-                if len(snapshot) - self.last_processed_samples < int(0.5 * self.audio_handler.sample_rate):
+                if len(snapshot) - self.last_processed_samples < int(self.partial_step_seconds * self.audio_handler.sample_rate):
                     continue
 
-                text, _, _ = self.stt_service.transcribe(snapshot, language=self.source_lang_code)
+                window_samples = int(self.partial_window_seconds * self.audio_handler.sample_rate)
+                live_window = snapshot[-window_samples:] if len(snapshot) > window_samples else snapshot
+                text, _, _ = self.stt_service.transcribe(live_window, language=self.source_lang_code)
                 self.last_processed_samples = len(snapshot)
-                if text and text != self.last_partial:
-                    self.last_partial = text
-                    self.partial_ready.emit(text)
+                if not text:
+                    continue
+
+                committed_chunk, self.pending_source_text = _advance_incremental_transcript(
+                    self.pending_source_text,
+                    text,
+                )
+                if committed_chunk:
+                    self.committed_source_text = _append_text(self.committed_source_text, committed_chunk)
+
+                display_text = _append_text(self.committed_source_text, self.pending_source_text)
+                if display_text and display_text != self.last_display_text:
+                    self.last_display_text = display_text
+                    self.partial_ready.emit(display_text)
 
             final_audio = self.audio_handler.stop_stream_recording()
             if final_audio is None or len(final_audio) == 0:
@@ -117,7 +395,19 @@ class StreamingSTTWorker(QThread):
                 return
 
             self.progress.emit("Finalizing transcription...")
-            final_text, _, _ = self.stt_service.transcribe(final_audio, language=self.source_lang_code)
+            tail_samples = int(
+                max(
+                    self.partial_window_seconds + self.partial_step_seconds,
+                    self.partial_window_seconds,
+                )
+                * self.audio_handler.sample_rate
+            )
+            final_tail_audio = final_audio[-tail_samples:] if len(final_audio) > tail_samples else final_audio
+            final_tail_text, _, _ = self.stt_service.transcribe(final_tail_audio, language=self.source_lang_code)
+            final_text = _append_text(
+                self.committed_source_text,
+                _finalize_incremental_transcript(self.pending_source_text, final_tail_text),
+            )
             if not final_text:
                 self.error.emit("Failed to recognize speech. Try again.")
                 return
@@ -153,6 +443,10 @@ class StreamingPipelineWorker(QThread):
         claude_client,
         stt_only,
         max_duration: int,
+        partial_interval: float,
+        partial_step_seconds: float,
+        partial_window_seconds: float,
+        auto_play_output: bool,
     ):
         super().__init__()
         self.audio_handler = audio_handler
@@ -165,8 +459,11 @@ class StreamingPipelineWorker(QThread):
         self.stt_only = stt_only
         self.max_duration = max_duration
         self.stop_requested = False
-        self.partial_interval = 1.0
+        self.partial_interval = partial_interval
         self.min_audio_seconds = 0.75
+        self.partial_step_seconds = partial_step_seconds
+        self.partial_window_seconds = partial_window_seconds
+        self.auto_play_output = auto_play_output
         self.last_processed_samples = 0
         self.last_source_text = ""
         self.last_translated_text = ""
@@ -176,6 +473,11 @@ class StreamingPipelineWorker(QThread):
         self.partial_translation_runs = 0
         self.partial_translation_wall = 0.0
         self.partial_translation_cpu = 0.0
+        self.committed_source_text = ""
+        self.pending_source_text = ""
+        self.committed_translation_text = ""
+        self.last_display_source = ""
+        self.last_display_translation = ""
 
     def stop(self):
         """Request the streaming loop to stop."""
@@ -195,6 +497,24 @@ class StreamingPipelineWorker(QThread):
         if translated_text:
             self.cache.set(text, source_lang, target_lang, translated_text)
         return translated_text
+
+    def _emit_partial_display(self):
+        """Update the GUI with committed text and the current unstable tail."""
+        source_text = _append_text(self.committed_source_text, self.pending_source_text)
+        translated_text = self.committed_translation_text or "Listening..."
+        if self.pending_source_text:
+            translated_text = _append_text(translated_text, "...")
+
+        if (
+            source_text
+            and (
+                source_text != self.last_display_source
+                or translated_text != self.last_display_translation
+            )
+        ):
+            self.last_display_source = source_text
+            self.last_display_translation = translated_text
+            self.partial_update.emit(source_text, translated_text)
 
     def run(self):
         """Capture audio, emit partial transcripts/translations, then finalize."""
@@ -218,33 +538,43 @@ class StreamingPipelineWorker(QThread):
                     continue
                 if len(snapshot) < int(self.min_audio_seconds * self.audio_handler.sample_rate):
                     continue
-                if len(snapshot) - self.last_processed_samples < int(0.5 * self.audio_handler.sample_rate):
+                if len(snapshot) - self.last_processed_samples < int(self.partial_step_seconds * self.audio_handler.sample_rate):
                     continue
 
+                window_samples = int(self.partial_window_seconds * self.audio_handler.sample_rate)
+                live_window = snapshot[-window_samples:] if len(snapshot) > window_samples else snapshot
                 stt_start = take_perf_sample()
-                text, _, _ = self.stt_service.transcribe(snapshot, language=source_lang_code)
+                text, _, _ = self.stt_service.transcribe(live_window, language=source_lang_code)
                 stt_end = take_perf_sample()
                 stt_metrics = stage_metrics(stt_start, stt_end)
                 self.partial_stt_runs += 1
                 self.partial_stt_wall += stt_metrics["wall_seconds"]
                 self.partial_stt_cpu += stt_metrics["total_cpu_seconds"]
                 self.last_processed_samples = len(snapshot)
-                if not text or text == self.last_source_text:
+                if not text:
                     continue
 
-                translate_start = take_perf_sample()
-                translated_text = self._translate_for_display(text, source_lang, target_lang)
-                translate_end = take_perf_sample()
-                translate_metrics = stage_metrics(translate_start, translate_end)
-                self.partial_translation_runs += 1
-                self.partial_translation_wall += translate_metrics["wall_seconds"]
-                self.partial_translation_cpu += translate_metrics["total_cpu_seconds"]
-                if not translated_text:
-                    translated_text = "Translating..."
+                committed_chunk, self.pending_source_text = _advance_incremental_transcript(
+                    self.pending_source_text,
+                    text,
+                )
 
-                self.last_source_text = text
-                self.last_translated_text = translated_text
-                self.partial_update.emit(text, translated_text)
+                if committed_chunk:
+                    self.committed_source_text = _append_text(self.committed_source_text, committed_chunk)
+                    translate_start = take_perf_sample()
+                    translated_chunk = self._translate_for_display(committed_chunk, source_lang, target_lang)
+                    translate_end = take_perf_sample()
+                    translate_metrics = stage_metrics(translate_start, translate_end)
+                    self.partial_translation_runs += 1
+                    self.partial_translation_wall += translate_metrics["wall_seconds"]
+                    self.partial_translation_cpu += translate_metrics["total_cpu_seconds"]
+                    if translated_chunk:
+                        self.committed_translation_text = _append_text(
+                            self.committed_translation_text,
+                            translated_chunk,
+                        )
+
+                self._emit_partial_display()
 
             final_audio = self.audio_handler.stop_stream_recording()
             if final_audio is None or len(final_audio) == 0:
@@ -253,20 +583,38 @@ class StreamingPipelineWorker(QThread):
 
             self.progress.emit("Finalizing transcription...")
             final_stt_start = take_perf_sample()
-            final_text, _, _ = self.stt_service.transcribe(final_audio, language=source_lang_code)
+            tail_samples = int(
+                max(
+                    self.partial_window_seconds + self.partial_step_seconds,
+                    self.partial_window_seconds,
+                )
+                * self.audio_handler.sample_rate
+            )
+            final_tail_audio = final_audio[-tail_samples:] if len(final_audio) > tail_samples else final_audio
+            final_tail_text, _, _ = self.stt_service.transcribe(final_tail_audio, language=source_lang_code)
             final_stt_end = take_perf_sample()
+
+            final_tail_source = _finalize_incremental_transcript(self.pending_source_text, final_tail_text)
+            final_text = _append_text(self.committed_source_text, final_tail_source)
             if not final_text:
                 self.error.emit("Failed to recognize speech. Try again.")
                 return
 
             final_translation_start = take_perf_sample()
-            final_translated = self._translate_for_display(final_text, source_lang, target_lang)
+            final_translated = self.committed_translation_text
+            if final_tail_source:
+                final_tail_translated = self._translate_for_display(
+                    final_tail_source,
+                    source_lang,
+                    target_lang,
+                )
+                final_translated = _append_text(final_translated, final_tail_translated)
             final_translation_end = take_perf_sample()
             if not final_translated:
                 self.error.emit("Translation failed. Try again.")
                 return
 
-            if not self.stt_only:
+            if not self.stt_only and self.auto_play_output:
                 self.progress.emit("Converting to speech...")
                 tts_start = take_perf_sample()
                 if not self.tts_service.speak(final_translated, target_lang):
@@ -276,6 +624,8 @@ class StreamingPipelineWorker(QThread):
             else:
                 tts_start = None
                 tts_end = None
+                if not self.stt_only and not self.auto_play_output:
+                    self.progress.emit("Auto-play disabled; skipping speech output")
 
             elapsed = f"{time.time() - start_time:.2f}s"
             pipeline_end = take_perf_sample()
@@ -361,6 +711,7 @@ class TranslationWorker(QThread):
         cache,
         claude_client,
         stt_only=False,
+        auto_play_output=True,
     ):
         super().__init__()
         self.audio_data = audio_data
@@ -372,6 +723,7 @@ class TranslationWorker(QThread):
         self.cache = cache
         self.claude_client = claude_client
         self.stt_only = stt_only
+        self.auto_play_output = auto_play_output
 
     def run(self):
         """Run translation pipeline in background"""
@@ -435,18 +787,24 @@ class TranslationWorker(QThread):
             self.progress.emit(f"Translated: {translated_text[:50]}...")
 
             # Step 3: Text-to-Speech
-            self.progress.emit("Converting to speech...")
-            tts_start = take_perf_sample()
-            if not self.tts_service.speak(translated_text, target_lang):
-                self.error.emit("Text-to-speech failed.")
-                return
-            tts_end = take_perf_sample()
+            if self.auto_play_output:
+                self.progress.emit("Converting to speech...")
+                tts_start = take_perf_sample()
+                if not self.tts_service.speak(translated_text, target_lang):
+                    self.error.emit("Text-to-speech failed.")
+                    return
+                tts_end = take_perf_sample()
+            else:
+                self.progress.emit("Auto-play disabled; skipping speech output")
+                tts_start = None
+                tts_end = None
 
             elapsed = time.time() - start_time
             pipeline_end = take_perf_sample()
             self.progress.emit(format_stage_metrics("STT", stt_start, stt_end))
             self.progress.emit(format_stage_metrics("Translation", translation_start, translation_end))
-            self.progress.emit(format_stage_metrics("TTS", tts_start, tts_end))
+            if tts_start is not None and tts_end is not None:
+                self.progress.emit(format_stage_metrics("TTS", tts_start, tts_end))
             self.progress.emit(format_stage_metrics("Pipeline total", pipeline_start, pipeline_end))
             self.progress.emit(f"Complete in {elapsed:.2f}s")
 
@@ -484,6 +842,102 @@ class TranslationWorker(QThread):
             self.work_finished.emit()
 
 
+class SettingsDialog(QDialog):
+    """Application settings dialog."""
+
+    def __init__(self, settings: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        self.resize(460, 380)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.stt_only_checkbox = QCheckBox("Run STT only")
+        self.stt_only_checkbox.setChecked(settings["stt_only_mode"])
+        form.addRow("Mode", self.stt_only_checkbox)
+
+        self.stt_device_combo = QComboBox()
+        self.stt_device_combo.addItem("CPU", "cpu")
+        self.stt_device_combo.addItem("CUDA / GPU", "cuda")
+        index = self.stt_device_combo.findData(settings["stt_device"])
+        self.stt_device_combo.setCurrentIndex(index if index >= 0 else 0)
+        form.addRow("STT device", self.stt_device_combo)
+
+        self.stt_benchmark_checkbox = QCheckBox("Benchmark same audio on CPU and GPU after each run")
+        self.stt_benchmark_checkbox.setChecked(settings["stt_benchmark_cpu_gpu"])
+        form.addRow("STT benchmark", self.stt_benchmark_checkbox)
+
+        self.live_streaming_checkbox = QCheckBox("Stream STT/translation while holding button")
+        self.live_streaming_checkbox.setChecked(settings["live_streaming"])
+        form.addRow("Live mode", self.live_streaming_checkbox)
+
+        self.auto_play_checkbox = QCheckBox("Speak translated output automatically")
+        self.auto_play_checkbox.setChecked(settings["auto_play_output"])
+        form.addRow("Auto-play", self.auto_play_checkbox)
+
+        self.show_logs_checkbox = QCheckBox("Show log panel")
+        self.show_logs_checkbox.setChecked(settings["show_logs"])
+        form.addRow("Logs", self.show_logs_checkbox)
+
+        self.max_duration_spin = QSpinBox()
+        self.max_duration_spin.setRange(5, 300)
+        self.max_duration_spin.setValue(settings["max_duration"])
+        self.max_duration_spin.setSuffix(" s")
+        form.addRow("Max recording", self.max_duration_spin)
+
+        self.partial_interval_spin = QDoubleSpinBox()
+        self.partial_interval_spin.setRange(0.5, 10.0)
+        self.partial_interval_spin.setSingleStep(0.5)
+        self.partial_interval_spin.setValue(settings["partial_interval"])
+        self.partial_interval_spin.setSuffix(" s")
+        form.addRow("Live poll interval", self.partial_interval_spin)
+
+        self.partial_step_spin = QDoubleSpinBox()
+        self.partial_step_spin.setRange(0.5, 15.0)
+        self.partial_step_spin.setSingleStep(0.5)
+        self.partial_step_spin.setValue(settings["partial_step_seconds"])
+        self.partial_step_spin.setSuffix(" s")
+        form.addRow("Live chunk advance", self.partial_step_spin)
+
+        self.partial_window_spin = QDoubleSpinBox()
+        self.partial_window_spin.setRange(2.0, 30.0)
+        self.partial_window_spin.setSingleStep(1.0)
+        self.partial_window_spin.setValue(settings["partial_window_seconds"])
+        self.partial_window_spin.setSuffix(" s")
+        form.addRow("Live window size", self.partial_window_spin)
+
+        self.connectivity_interval_spin = QSpinBox()
+        self.connectivity_interval_spin.setRange(5, 300)
+        self.connectivity_interval_spin.setValue(settings["connectivity_interval"])
+        self.connectivity_interval_spin.setSuffix(" s")
+        form.addRow("Connectivity check", self.connectivity_interval_spin)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_values(self) -> dict:
+        """Return dialog values."""
+        return {
+            "stt_only_mode": self.stt_only_checkbox.isChecked(),
+            "stt_device": self.stt_device_combo.currentData(),
+            "stt_benchmark_cpu_gpu": self.stt_benchmark_checkbox.isChecked(),
+            "live_streaming": self.live_streaming_checkbox.isChecked(),
+            "auto_play_output": self.auto_play_checkbox.isChecked(),
+            "show_logs": self.show_logs_checkbox.isChecked(),
+            "max_duration": self.max_duration_spin.value(),
+            "partial_interval": self.partial_interval_spin.value(),
+            "partial_step_seconds": self.partial_step_spin.value(),
+            "partial_window_seconds": self.partial_window_spin.value(),
+            "connectivity_interval": self.connectivity_interval_spin.value(),
+        }
+
+
 class MainWindow(QMainWindow):
     """Main application window"""
 
@@ -497,6 +951,7 @@ class MainWindow(QMainWindow):
         # Initialize config and lightweight services only.
         self.config = get_config()
         logger.info("Initializing GUI services...")
+        whisper_config = self.config.get_whisper_model()
 
         self.stt_service = None
         self.translation_service = None
@@ -507,7 +962,23 @@ class MainWindow(QMainWindow):
         self.audio_handler = AudioHandler(sample_rate=16000)
         self.cache = TranslationCache(db_path="cache.db")
         self.audio_config = self.config.get_audio_config()
-        self.stt_only_mode = False
+        self.stt_model_name = whisper_config.get("model", "base")
+        self.stt_device = self.config.get("offline.whisper_device", whisper_config.get("device", "cpu"))
+        self.stt_cpu_compute_type = whisper_config.get("compute_type", "int8")
+        self.stt_gpu_compute_type = whisper_config.get("gpu_compute_type", "float16")
+        self.stt_cpu_threads = whisper_config.get("cpu_threads", 0)
+        self.stt_num_workers = whisper_config.get("num_workers", 1)
+        self.stt_beam_size = whisper_config.get("beam_size", 1)
+        self.stt_vad_filter = whisper_config.get("vad_filter", True)
+        self.stt_benchmark_cpu_gpu = self.config.get("ui.stt_benchmark_cpu_gpu", False)
+        self.stt_only_mode = self.config.get("ui.stt_only_mode", False)
+        self.live_streaming_enabled = self.config.get("ui.live_streaming", False)
+        self.auto_play_output = self.config.get("ui.auto_play_output", True)
+        self.show_logs = self.config.get("ui.show_logs", True)
+        self.partial_interval = float(self.config.get("ui.live_partial_interval", 1.0))
+        self.partial_step_seconds = float(self.config.get("ui.live_partial_step", 2.0))
+        self.partial_window_seconds = float(self.config.get("ui.live_partial_window", 6.0))
+        self.connectivity_interval = int(self.config.get("ui.connectivity_interval", 10))
 
         # State
         self.is_recording = False
@@ -516,15 +987,19 @@ class MainWindow(QMainWindow):
         self.recording_thread = None
         self.streaming_stt_worker = None
         self.streaming_pipeline_worker = None
+        self.translation_warmup_worker = None
+        self.translation_warming_pair = None
+        self.stt_benchmark_worker = None
         self.worker_thread = None
         self.last_live_log_text = ""
+        self.pending_stt_benchmark = None
 
         # UI Setup
         self._init_ui()
         self._connect_signals()
 
         # Start connectivity monitoring
-        self.connectivity_service.start_monitoring()
+        self.connectivity_service.start_monitoring(interval=self.connectivity_interval)
 
         logger.info("GUI initialized")
 
@@ -578,9 +1053,10 @@ class MainWindow(QMainWindow):
         control_layout = QVBoxLayout()
 
         # PTT Button (main control)
-        self.ptt_button = QPushButton("🎙️  PRESS TO TALK  🔊")
+        self.ptt_button = QPushButton("🎙️  START RECORDING  🔊")
         self.ptt_button.setFont(QFont("Arial", 14, QFont.Bold))
         self.ptt_button.setMinimumHeight(60)
+        self.ptt_button.setCheckable(True)
         self.ptt_button.setStyleSheet(
             """
             QPushButton {
@@ -603,23 +1079,27 @@ class MainWindow(QMainWindow):
         self.ptt_button.setFocusPolicy(Qt.NoFocus)
         control_layout.addWidget(self.ptt_button)
 
-        # Language switching
+        # Language selection
         lang_layout = QHBoxLayout()
-        self.prev_lang_btn = QPushButton("← Prev")
-        self.prev_lang_btn.setMinimumWidth(100)
-        self.prev_lang_btn.setMinimumHeight(40)
-
-        self.next_lang_btn = QPushButton("Next →")
-        self.next_lang_btn.setMinimumWidth(100)
-        self.next_lang_btn.setMinimumHeight(40)
+        self.source_lang_combo = QComboBox()
+        self.source_lang_combo.setMinimumWidth(160)
+        self.source_lang_combo.setMinimumHeight(40)
+        self.target_lang_combo = QComboBox()
+        self.target_lang_combo.setMinimumWidth(160)
+        self.target_lang_combo.setMinimumHeight(40)
+        for language in self.language_service.get_supported_languages():
+            label = language.capitalize()
+            self.source_lang_combo.addItem(label, language)
+            self.target_lang_combo.addItem(label, language)
 
         self.settings_btn = QPushButton("⚙️ Settings")
         self.settings_btn.setMinimumWidth(100)
         self.settings_btn.setMinimumHeight(40)
 
-        lang_layout.addWidget(self.prev_lang_btn)
-        lang_layout.addStretch()
-        lang_layout.addWidget(self.next_lang_btn)
+        lang_layout.addWidget(QLabel("From"))
+        lang_layout.addWidget(self.source_lang_combo)
+        lang_layout.addWidget(QLabel("To"))
+        lang_layout.addWidget(self.target_lang_combo)
         lang_layout.addStretch()
         lang_layout.addWidget(self.settings_btn)
 
@@ -639,6 +1119,7 @@ class MainWindow(QMainWindow):
         self.log_display.setMaximumHeight(150)
         self.log_display.setStyleSheet("background-color: #f5f5f5; font-family: monospace;")
         main_layout.addWidget(self.log_display)
+        self.log_display.setVisible(self.show_logs)
 
         central_widget.setLayout(main_layout)
 
@@ -653,12 +1134,11 @@ class MainWindow(QMainWindow):
     def _connect_signals(self):
         """Connect UI signals to slots"""
         # PTT Button
-        self.ptt_button.mousePressEvent = self._on_ptt_pressed
-        self.ptt_button.mouseReleaseEvent = self._on_ptt_released
+        self.ptt_button.clicked.connect(self._on_ptt_clicked)
 
-        # Language buttons
-        self.prev_lang_btn.clicked.connect(self._on_prev_language)
-        self.next_lang_btn.clicked.connect(self._on_next_language)
+        # Language selectors
+        self.source_lang_combo.currentIndexChanged.connect(self._on_source_language_changed)
+        self.target_lang_combo.currentIndexChanged.connect(self._on_target_language_changed)
         self.settings_btn.clicked.connect(self._on_settings)
 
         # Connectivity callback
@@ -668,19 +1148,29 @@ class MainWindow(QMainWindow):
         # Log signal
         logger.info("All signals connected")
 
+    def _on_ptt_clicked(self, checked: bool):
+        """Toggle recording on/off with a single button."""
+        if checked:
+            self._on_ptt_pressed(None)
+        else:
+            self._on_ptt_released(None)
+
     def _on_ptt_pressed(self, event):
-        """Handle PTT button press"""
+        """Handle recording start."""
         if self.is_recording or self.is_processing or self.is_streaming:
+            self.ptt_button.setChecked(self.is_recording)
             return
 
         if not self._ensure_pipeline_services():
+            self.ptt_button.setChecked(False)
             return
 
         self.is_recording = True
         self.audio_handler.is_recording = True
         self.source_text.clear()
-        self.translated_text.setText("Streaming STT active...")
-        self.ptt_button.setText("🎙️  RECORDING...  🔊")
+        self.translated_text.setText("Recording in progress...")
+        self.ptt_button.setChecked(True)
+        self.ptt_button.setText("⏹️  STOP RECORDING  🔊")
         self.ptt_button.setStyleSheet(
             """
             QPushButton {
@@ -697,6 +1187,18 @@ class MainWindow(QMainWindow):
         self._log("Recording audio...")
         self.last_live_log_text = ""
         self.status_label.setText("Listening...")
+        self._start_translation_warmup()
+
+        if not self.live_streaming_enabled:
+            self.recording_thread = RecordingWorker(
+                self.audio_handler,
+                self.audio_config.get("max_duration", 10),
+            )
+            self.recording_thread.audio_ready.connect(self._on_audio_recorded)
+            self.recording_thread.error.connect(self._on_recording_error)
+            self.recording_thread.finished.connect(self._on_recording_finished)
+            self.recording_thread.start()
+            return
 
         self.is_streaming = True
         if self.stt_only_mode:
@@ -708,6 +1210,9 @@ class MainWindow(QMainWindow):
                 source_lang,
                 source_lang_code,
                 self.audio_config.get("max_duration", 10),
+                self.partial_interval,
+                self.partial_step_seconds,
+                self.partial_window_seconds,
             )
             self.streaming_stt_worker.progress.connect(self._on_progress)
             self.streaming_stt_worker.partial_ready.connect(self._on_partial_stt_ready)
@@ -727,6 +1232,10 @@ class MainWindow(QMainWindow):
             self.claude_client,
             self.stt_only_mode,
             self.audio_config.get("max_duration", 10),
+            self.partial_interval,
+            self.partial_step_seconds,
+            self.partial_window_seconds,
+            self.auto_play_output,
         )
         self.streaming_pipeline_worker.progress.connect(self._on_progress)
         self.streaming_pipeline_worker.partial_update.connect(self._on_partial_pipeline_update)
@@ -737,23 +1246,27 @@ class MainWindow(QMainWindow):
         self.streaming_pipeline_worker.start()
 
     def _on_ptt_released(self, event):
-        """Handle PTT button release"""
+        """Handle recording stop."""
         if not self.is_recording:
+            self.ptt_button.setChecked(False)
             return
 
         self.audio_handler.stop_recording()
         self.ptt_button.setText("⏳  FINALIZING...  🔊")
         self.statusBar().showMessage("Stopping recording...")
         self.ptt_button.setEnabled(False)
+        if self.recording_thread is not None and self.recording_thread.isRunning():
+            return
         if self.streaming_stt_worker is not None:
             self.streaming_stt_worker.stop()
         if self.streaming_pipeline_worker is not None:
             self.streaming_pipeline_worker.stop()
 
     def _reset_ptt_button(self):
-        """Restore the default push-to-talk button style."""
+        """Restore the default toggle button style."""
         self.is_recording = False
-        self.ptt_button.setText("🎙️  PRESS TO TALK  🔊")
+        self.ptt_button.setChecked(False)
+        self.ptt_button.setText("🎙️  START RECORDING  🔊")
         self.ptt_button.setStyleSheet(
             """
             QPushButton {
@@ -777,12 +1290,73 @@ class MainWindow(QMainWindow):
         """Handle recorded audio coming back from the capture thread."""
         self._process_audio(audio_data)
 
+    def _on_recording_finished(self):
+        """Handle when batch audio capture completes."""
+        self.recording_thread = None
+
     def _on_recording_error(self, error: str):
         """Handle recording failures."""
+        self.pending_stt_benchmark = None
         self._reset_ptt_button()
         self.ptt_button.setEnabled(True)
         self.statusBar().showMessage("Recording failed")
         self._log(f"ERROR: {error}")
+
+    def _start_translation_warmup(self, force: bool = False):
+        """Warm the currently selected translation route in the background."""
+        if self.stt_only_mode:
+            return
+
+        if self.translation_service is None:
+            try:
+                self.translation_service = get_translation_service()
+            except Exception as e:
+                logger.error(f"Failed to initialize translation service for warmup: {e}")
+                return
+
+        source_lang, target_lang = self.language_service.get_current_pair()
+        pair = (source_lang, target_lang)
+
+        try:
+            route_models = self.translation_service.get_route_model_names(source_lang, target_lang)
+        except Exception as e:
+            logger.error(f"Cannot determine warmup route for {source_lang} -> {target_lang}: {e}")
+            return
+
+        if not force and all(model_name in self.translation_service.loaded_pipelines for model_name in route_models):
+            return
+
+        if self.translation_warmup_worker is not None and self.translation_warmup_worker.isRunning():
+            if self.translation_warming_pair == pair:
+                return
+            return
+
+        self.translation_warming_pair = pair
+        self.translation_warmup_worker = TranslationWarmupWorker(
+            self.translation_service,
+            source_lang,
+            target_lang,
+        )
+        self.translation_warmup_worker.progress.connect(self._on_progress)
+        self.translation_warmup_worker.error.connect(self._on_error)
+        self.translation_warmup_worker.warmed.connect(self._on_translation_warmup_finished)
+        self.translation_warmup_worker.finished.connect(self._on_translation_warmup_thread_finished)
+        self.translation_warmup_worker.start()
+
+    def _on_translation_warmup_finished(self, source_lang: str, target_lang: str):
+        """Handle successful completion of translation model warmup."""
+        if self.translation_warming_pair == (source_lang, target_lang):
+            self._log(f"Translation route ready: {source_lang.capitalize()} -> {target_lang.capitalize()}")
+
+    def _on_translation_warmup_thread_finished(self):
+        """Clear warmup worker state once it exits."""
+        warmed_pair = self.translation_warming_pair
+        self.translation_warmup_worker = None
+        self.translation_warming_pair = None
+        if not self.stt_only_mode:
+            current_pair = self.language_service.get_current_pair()
+            if warmed_pair is not None and current_pair != warmed_pair:
+                self._start_translation_warmup(force=True)
 
     def _process_audio(self, audio_data):
         """Process recorded audio through the active pipeline stage."""
@@ -797,6 +1371,15 @@ class MainWindow(QMainWindow):
         if not self._ensure_pipeline_services():
             self.ptt_button.setEnabled(True)
             return
+
+        source_lang, _ = self.language_service.get_current_pair()
+        source_lang_code = self.language_service.get_language_code(source_lang)
+        self.pending_stt_benchmark = None
+        if self.stt_benchmark_cpu_gpu and not self.live_streaming_enabled:
+            self.pending_stt_benchmark = {
+                "audio_data": audio_data,
+                "source_lang_code": source_lang_code,
+            }
 
         # Start worker thread for processing
         self.is_processing = True
@@ -814,6 +1397,7 @@ class MainWindow(QMainWindow):
             self.cache,
             self.claude_client,
             stt_only=self.stt_only_mode,
+            auto_play_output=self.auto_play_output,
         )
 
         self.worker_thread.progress.connect(self._on_progress)
@@ -851,6 +1435,7 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, error: str):
         """Handle errors"""
+        self.pending_stt_benchmark = None
         self._log(f"ERROR: {error}")
         self.statusBar().showMessage(f"Error: {error}")
 
@@ -859,6 +1444,8 @@ class MainWindow(QMainWindow):
         self.source_text.setText(source_text)
         self.translated_text.setText(translated_text)
         self._log(f"✓ Complete in {elapsed}")
+        if self.pending_stt_benchmark and self.stt_benchmark_worker is None:
+            self._start_stt_benchmark()
 
     def _on_cloud_refinement_ready(
         self,
@@ -899,21 +1486,119 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Ready")
         self.streaming_pipeline_worker = None
 
-    def _on_prev_language(self):
-        """Switch to previous language pair"""
-        self.language_service.switch_language_prev()
-        self._update_language_display()
-        self._log(f"Switched to: {self.language_service.display_pair()}")
+    def _on_source_language_changed(self, index: int):
+        """Handle source language dropdown changes."""
+        source = self.source_lang_combo.itemData(index)
+        target = self.target_lang_combo.currentData()
+        self._apply_language_selection(source, target, changed="source")
 
-    def _on_next_language(self):
-        """Switch to next language pair"""
-        self.language_service.switch_language_next()
+    def _on_target_language_changed(self, index: int):
+        """Handle target language dropdown changes."""
+        source = self.source_lang_combo.currentData()
+        target = self.target_lang_combo.itemData(index)
+        self._apply_language_selection(source, target, changed="target")
+
+    def _apply_language_selection(self, source: str, target: str, changed: str):
+        """Apply the selected source/target language pair."""
+        if not source or not target:
+            return
+
+        supported = self.language_service.get_supported_languages()
+        if source == target:
+            for language in supported:
+                if language != source:
+                    if changed == "source":
+                        target = language
+                    else:
+                        source = language
+                    break
+
+        if not self.language_service.set_language_pair(source, target):
+            return
+
         self._update_language_display()
         self._log(f"Switched to: {self.language_service.display_pair()}")
+        self._start_translation_warmup(force=True)
 
     def _on_settings(self):
-        """Open settings dialog"""
-        self._log("Settings: Not yet implemented")
+        """Open settings dialog and apply runtime settings."""
+        dialog = SettingsDialog(
+            {
+                "stt_only_mode": self.stt_only_mode,
+                "stt_device": self.stt_device,
+                "stt_benchmark_cpu_gpu": self.stt_benchmark_cpu_gpu,
+                "live_streaming": self.live_streaming_enabled,
+                "auto_play_output": self.auto_play_output,
+                "show_logs": self.show_logs,
+                "max_duration": int(self.audio_config.get("max_duration", 10)),
+                "partial_interval": self.partial_interval,
+                "partial_step_seconds": self.partial_step_seconds,
+                "partial_window_seconds": self.partial_window_seconds,
+                "connectivity_interval": self.connectivity_interval,
+            },
+            self,
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        settings = dialog.get_values()
+        if settings["live_streaming"] and settings["partial_window_seconds"] < settings["partial_step_seconds"]:
+            QMessageBox.warning(
+                self,
+                "Invalid Settings",
+                "Live window size must be greater than or equal to live chunk advance.",
+            )
+            return
+
+        self.stt_only_mode = settings["stt_only_mode"]
+        self.stt_device = settings["stt_device"]
+        self.stt_benchmark_cpu_gpu = settings["stt_benchmark_cpu_gpu"]
+        self.live_streaming_enabled = settings["live_streaming"]
+        self.auto_play_output = settings["auto_play_output"]
+        self.show_logs = settings["show_logs"]
+        self.audio_config["max_duration"] = settings["max_duration"]
+        self.partial_interval = settings["partial_interval"]
+        self.partial_step_seconds = settings["partial_step_seconds"]
+        self.partial_window_seconds = settings["partial_window_seconds"]
+        self.connectivity_interval = settings["connectivity_interval"]
+        self.log_display.setVisible(self.show_logs)
+
+        if self.connectivity_service.check_interval != self.connectivity_interval:
+            self.connectivity_service.stop_monitoring()
+            self.connectivity_service.start_monitoring(interval=self.connectivity_interval)
+
+        self.config.update(
+            {
+                "offline.whisper_device": self.stt_device,
+                "ui.stt_only_mode": self.stt_only_mode,
+                "ui.stt_benchmark_cpu_gpu": self.stt_benchmark_cpu_gpu,
+                "ui.live_streaming": self.live_streaming_enabled,
+                "ui.auto_play_output": self.auto_play_output,
+                "ui.show_logs": self.show_logs,
+                "ui.live_partial_interval": self.partial_interval,
+                "ui.live_partial_step": self.partial_step_seconds,
+                "ui.live_partial_window": self.partial_window_seconds,
+                "ui.connectivity_interval": self.connectivity_interval,
+                "audio.max_duration": settings["max_duration"],
+            },
+            persist=True,
+        )
+
+        desired_compute_type = self._get_stt_compute_type_for_device(self.stt_device)
+        if self.stt_service is not None:
+            if (
+                self.stt_service.device != self.stt_device
+                or self.stt_service.compute_type != desired_compute_type
+            ):
+                self.stt_service.unload_model()
+                self.stt_service = None
+                self._log(
+                    f"STT backend set to {self.stt_device} ({desired_compute_type}); model will reload on next use"
+                )
+
+        self.status_label.setText("STT Ready" if self.stt_only_mode else "Ready")
+        self.statusBar().showMessage("Settings updated")
+        self._log("Settings updated")
         logger.info("Settings button clicked")
 
     def _on_connectivity_changed(self, is_online: bool):
@@ -924,8 +1609,19 @@ class MainWindow(QMainWindow):
 
     def _update_language_display(self):
         """Update language pair display"""
+        source, target = self.language_service.get_current_pair()
         pair_str = self.language_service.display_pair()
         self.language_label.setText(pair_str)
+        self.source_lang_combo.blockSignals(True)
+        self.target_lang_combo.blockSignals(True)
+        source_index = self.source_lang_combo.findData(source)
+        target_index = self.target_lang_combo.findData(target)
+        if source_index >= 0:
+            self.source_lang_combo.setCurrentIndex(source_index)
+        if target_index >= 0:
+            self.target_lang_combo.setCurrentIndex(target_index)
+        self.source_lang_combo.blockSignals(False)
+        self.target_lang_combo.blockSignals(False)
 
     def _update_connectivity_display(self):
         """Update connectivity indicator"""
@@ -936,6 +1632,40 @@ class MainWindow(QMainWindow):
         else:
             self.connectivity_label.setText("🔴 Offline")
             self.connectivity_label.setStyleSheet("color: red; font-weight: bold;")
+
+    def _get_stt_compute_type_for_device(self, device: str) -> str:
+        """Return the preferred compute type for one STT device."""
+        if device == "cuda":
+            return self.stt_gpu_compute_type
+        return self.stt_cpu_compute_type
+
+    def _start_stt_benchmark(self):
+        """Run an optional STT CPU/GPU benchmark on the latest audio clip."""
+        if not self.pending_stt_benchmark or self.stt_benchmark_worker is not None:
+            return
+
+        benchmark = self.pending_stt_benchmark
+        self.pending_stt_benchmark = None
+        self.stt_benchmark_worker = STTBenchmarkWorker(
+            benchmark["audio_data"],
+            benchmark["source_lang_code"],
+            self.stt_model_name,
+            self.stt_device,
+            self._get_stt_compute_type_for_device(self.stt_device),
+            self.stt_cpu_compute_type,
+            self.stt_gpu_compute_type,
+            self.stt_cpu_threads,
+            self.stt_num_workers,
+            self.stt_beam_size,
+            self.stt_vad_filter,
+        )
+        self.stt_benchmark_worker.progress.connect(self._on_progress)
+        self.stt_benchmark_worker.work_finished.connect(self._on_stt_benchmark_finished)
+        self.stt_benchmark_worker.start()
+
+    def _on_stt_benchmark_finished(self):
+        """Handle completion of the optional STT benchmark."""
+        self.stt_benchmark_worker = None
 
     def _log(self, message: str):
         """Add message to log display"""
@@ -954,13 +1684,22 @@ class MainWindow(QMainWindow):
     def _ensure_pipeline_services(self) -> bool:
         """Load only the services needed for the current test stage."""
         errors = []
+        desired_compute_type = self._get_stt_compute_type_for_device(self.stt_device)
 
-        if self.stt_service is None:
+        if (
+            self.stt_service is None
+            or self.stt_service.device != self.stt_device
+            or self.stt_service.compute_type != desired_compute_type
+        ):
             try:
                 self.status_label.setText("Loading STT...")
                 self.statusBar().showMessage("Loading speech-to-text model...")
                 load_start = take_perf_sample()
-                self.stt_service = get_stt_service()
+                self.stt_service = get_stt_service(
+                    device=self.stt_device,
+                    compute_type=desired_compute_type,
+                    force_reload=self.stt_service is not None,
+                )
                 load_end = take_perf_sample()
                 self._log(format_stage_metrics("STT load", load_start, load_end))
             except Exception as e:
@@ -991,7 +1730,7 @@ class MainWindow(QMainWindow):
                 logger.error(f"Failed to initialize translation service: {e}")
                 errors.append(f"Translation unavailable: {e}")
 
-        if self.tts_service is None:
+        if self.auto_play_output and self.tts_service is None:
             try:
                 self.status_label.setText("Loading TTS...")
                 self.statusBar().showMessage("Loading text-to-speech engine...")
@@ -1022,6 +1761,10 @@ class MainWindow(QMainWindow):
         if self.streaming_pipeline_worker is not None:
             self.streaming_pipeline_worker.stop()
             self.streaming_pipeline_worker.wait(5000)
+        if self.translation_warmup_worker is not None and self.translation_warmup_worker.isRunning():
+            self.translation_warmup_worker.wait(5000)
+        if self.stt_benchmark_worker is not None and self.stt_benchmark_worker.isRunning():
+            self.stt_benchmark_worker.wait(5000)
         if self.recording_thread is not None and self.recording_thread.isRunning():
             self.recording_thread.wait(5000)
         if self.worker_thread is not None and self.worker_thread.isRunning():

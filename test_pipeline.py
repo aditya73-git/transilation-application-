@@ -35,9 +35,9 @@ def test_pipeline():
         translator = get_translation_service()
         print("    ✓ translation service loaded")
 
-        print("  - Loading TTS (pyttsx3)...")
+        print("  - Loading TTS (Piper)...")
         tts = get_tts_service()
-        print("    ✓ pyttsx3 loaded")
+        print("    ✓ Piper TTS ready")
 
         print("  - Loading Language Service...")
         lang_service = get_language_service()
