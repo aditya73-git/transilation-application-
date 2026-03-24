@@ -1,15 +1,12 @@
 # Offline Translator Configuration File
 
-# Supported offline GUI languages
+# Supported offline languages
 languages:
   supported:
     - english
     - german
-    - arabic
-    - romanian
-    - slovakian
-    - turkish
-    - polish
+    - italian
+    - hindi
 
   # Default language pair
   default_pair:
@@ -20,11 +17,8 @@ languages:
   code_mappings:
     english: en
     german: de
-    arabic: ar
-    romanian: ro
-    slovakian: sk
-    turkish: tr
-    polish: pl
+    italian: it
+    hindi: hi
 
 # Offline model configuration
 offline:
@@ -50,35 +44,19 @@ offline:
     english:
       german:
         model: Helsinki-NLP/opus-mt-en-de
-      arabic:
-        model: Helsinki-NLP/opus-mt-tc-big-en-ar
-      romanian:
-        model: Helsinki-NLP/opus-mt-en-ro
-      slovakian:
-        model: Helsinki-NLP/opus-mt-en-sk
-      turkish:
-        model: Helsinki-NLP/opus-mt-tc-big-en-tr
-      polish:
-        model: Helsinki-NLP/opus-mt-en-zlw
-        input_prefix: ">>pol<< "
+      italian:
+        model: Helsinki-NLP/opus-mt-en-it
+      hindi:
+        model: Helsinki-NLP/opus-mt-en-hi
     german:
       english:
         model: Helsinki-NLP/opus-mt-de-en
-    arabic:
+    italian:
       english:
-        model: Helsinki-NLP/opus-mt-ar-en
-    romanian:
+        model: Helsinki-NLP/opus-mt-it-en
+    hindi:
       english:
-        model: Helsinki-NLP/opus-mt-ROMANCE-en
-    slovakian:
-      english:
-        model: Helsinki-NLP/opus-mt-sk-en
-    turkish:
-      english:
-        model: Helsinki-NLP/opus-mt-tr-en
-    polish:
-      english:
-        model: Helsinki-NLP/opus-mt-pl-en
+        model: Helsinki-NLP/opus-mt-hi-en
 
   # TTS engine
   tts_engine: piper
@@ -97,31 +75,16 @@ offline:
       config: ./models/piper/german.onnx.json
       model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx?download=true
       config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json?download=true
-    arabic:
-      model: ./models/piper/arabic.onnx
-      config: ./models/piper/arabic.onnx.json
-      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ar/ar_JO/kareem/medium/ar_JO-kareem-medium.onnx?download=true
-      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ar/ar_JO/kareem/medium/ar_JO-kareem-medium.onnx.json?download=true
-    romanian:
-      model: ./models/piper/romanian.onnx
-      config: ./models/piper/romanian.onnx.json
-      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ro/ro_RO/mihai/medium/ro_RO-mihai-medium.onnx?download=true
-      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ro/ro_RO/mihai/medium/ro_RO-mihai-medium.onnx.json?download=true
-    slovakian:
-      model: ./models/piper/slovakian.onnx
-      config: ./models/piper/slovakian.onnx.json
-      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/sk/sk_SK/lili/medium/sk_SK-lili-medium.onnx?download=true
-      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/sk/sk_SK/lili/medium/sk_SK-lili-medium.onnx.json?download=true
-    turkish:
-      model: ./models/piper/turkish.onnx
-      config: ./models/piper/turkish.onnx.json
-      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx?download=true
-      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/tr/tr_TR/fettah/medium/tr_TR-fettah-medium.onnx.json?download=true
-    polish:
-      model: ./models/piper/polish.onnx
-      config: ./models/piper/polish.onnx.json
-      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/pl/pl_PL/darkman/medium/pl_PL-darkman-medium.onnx?download=true
-      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/pl/pl_PL/darkman/medium/pl_PL-darkman-medium.onnx.json?download=true
+    italian:
+      model: ./models/piper/italian.onnx
+      config: ./models/piper/italian.onnx.json
+      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/it/it_IT/paola/medium/it_IT-paola-medium.onnx?download=true
+      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/it/it_IT/paola/medium/it_IT-paola-medium.onnx.json?download=true
+    hindi:
+      model: ./models/piper/hindi.onnx
+      config: ./models/piper/hindi.onnx.json
+      model_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx?download=true
+      config_url: https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx.json?download=true
 
 # Cloud integration (Claude API for refinements)
 cloud:

@@ -1,4 +1,4 @@
-"""Offline Translator - Desktop GUI Version"""
+"""Offline Translator - Terminal Pi Version."""
 
 __version__ = "0.1.0"
 __author__ = "Aditya"

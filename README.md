@@ -1,17 +1,16 @@
-# Offline Translator - Desktop GUI Version
+# Offline Translator - Terminal Pi Version
 
-A push-to-talk offline translator application designed for testing and development before deployment on Raspberry Pi hardware.
+A terminal-first offline translator application designed for Raspberry Pi hardware.
 
 ## Features
 
-- 🎙️ Push-to-talk interface (GUI button replaces physical button)
-- 🌐 7 supported language pairs:
+- 🎙️ Terminal-driven recording and translation flow
+- 🌐 4 supported languages:
   - English ↔ German
-  - English ↔ Arabic
-  - English ↔ Romanian
-  - English ↔ Slovakian
-  - English ↔ Turkish
-  - English ↔ Polish
+  - English ↔ Italian
+  - English ↔ Hindi
+  - German ↔ Italian/Hindi via English pivot
+  - Italian ↔ Hindi via English pivot
 - 📴 Fully offline translation (no internet required)
 - ☁️ Optional cloud refinement for better quality translations
 - 💾 Translation caching for repeated phrases
@@ -27,7 +26,7 @@ Audio Input (Microphone)
     ↓
 [Detect Language]
     ↓
-[Translation] M2M-100
+[Translation] Marian / OPUS models
     ↓
 [TTS] Text-to-Speech
     ↓
@@ -76,7 +75,7 @@ Audio Output (Speakers)
 
 ## Usage
 
-### Run the GUI Application
+### Run the Terminal Application
 ```bash
 python -m src.main
 ```
@@ -84,41 +83,16 @@ python -m src.main
 This will:
 1. Load language models (first run takes 2-3 minutes)
 2. Initialize audio system
-3. Open the GUI window
-4. Await button presses
+3. Start the terminal command loop
+4. Await terminal commands
 
 ### Using the Application
 
-1. **Start Application** → Models load and display "Ready"
-2. **Click "Press to Talk" Button** → Start recording
-3. **Release Button** → Processing begins:
-   - Speech-to-text (2-3 seconds)
-   - Translation (1-2 seconds)
-   - Text-to-speech (2-3 seconds)
-   - Audio plays through speakers
-4. **Switch Languages** ← Click/→ Buttons → Cycle through language pairs
-
-### GUI Layout
-
-```
-┌─────────────────────────────────────────┐
-│  🎤 OFFLINE TRANSLATOR - Desktop v0.1   │
-├─────────────────────────────────────────┤
-│  Status: Ready | 🟢 Offline | EN→DE     │
-├─────────────────────────────────────────┤
-│  SOURCE TEXT:                           │
-│  [Recognized speech]                    │
-│                                         │
-│  TRANSLATED OUTPUT:                     │
-│  [Translation result]                   │
-├─────────────────────────────────────────┤
-│        [Press to Talk]                  │
-│  [← >>] Language Pair [>> →]            │
-│        [Settings]                       │
-├─────────────────────────────────────────┤
-│  Log: Ready...                          │
-└─────────────────────────────────────────┘
-```
+1. Start the application
+2. Use `pairs`, `set english german`, `next`, or `prev` to choose a language pair
+3. Use `record` to capture speech from the microphone until you press Enter
+4. Use `text hello world` to translate typed input
+5. Use `status`, `devices`, and `stt-only` as needed
 
 ## Configuration
 
@@ -132,11 +106,11 @@ offline:
   whisper_model: base
   whisper_compute_type: int8
 
-  # Translation model (lightweight option)
-  m2m_model: facebook/m2m100_418M
+  # Translation model routing
+  translation_strategy: pivot_english
 
   # TTS engine
-  tts_engine: pyttsx3
+  tts_engine: piper
 ```
 
 ### Audio Settings
@@ -170,9 +144,9 @@ Expected timing on modern laptop:
 - Models (~3GB total) require significant disk space
 
 ### Microphone not detected
-- Check audio settings in system preferences
-- Run `sounddevice` test to list devices
-- Select correct device in GUI settings
+- Check ALSA / PipeWire device availability
+- Run the `devices` command in the terminal app
+- Verify `pw-record`, `arecord`, or `sounddevice` works on the Pi
 
 ### High latency
 - Reduce model size in config (tiny → base)
@@ -181,7 +155,7 @@ Expected timing on modern laptop:
 
 ### Poor translation quality
 - Enable cloud refinement if online
-- This model trade-off is expected for offline-only operation
+- Pivot routes (for example German → Hindi) may be less natural than direct language-pair models
 
 ## Project Structure
 
@@ -198,29 +172,23 @@ src/
 │   ├── language_service.py     # Language management
 │   └── connectivity_service.py # Internet detection
 │
-├── ui/
-│   ├── main_window.py          # Main GUI window
-│   ├── components.py           # Reusable widgets
-│   └── styles.qss              # Stylesheet
-│
 ├── utils/
 │   ├── logger.py               # Logging setup
 │   ├── cache.py                # Translation cache
 │   └── audio_handler.py        # Audio I/O
 │
 └── cloud/
-    └── claude_client.py        # Claude API client
+    └── claude_client.py        # Cloud refinement client
 ```
 
 ## Next Steps - Pi Deployment
 
 When moving to Raspberry Pi:
 1. Switch to quantized models (`tiny-int8`, `418M-int8`)
-2. Remove PyQt5 GUI → Use CLI or buttons
-3. Add GPIO button handling
-4. Integrate with system audio (USB soundcard)
-5. Create systemd service for auto-start
-6. Optimize for power consumption
+2. Add GPIO button handling
+3. Integrate with system audio (USB soundcard)
+4. Create systemd service for auto-start
+5. Optimize for power consumption
 
 ## Development Notes
 
@@ -246,5 +214,5 @@ For issues or questions, check:
 
 ---
 
-**Status**: Alpha (Desktop testing phase)
+**Status**: Alpha (terminal Pi testing phase)
 **Target**: Raspberry Pi 4/5 with bone-conduction earpiece

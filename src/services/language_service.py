@@ -8,7 +8,7 @@ logger = get_logger(__name__)
 
 
 class LanguageService:
-    """Manage the offline GUI language matrix and active pair."""
+    """Manage the offline language matrix and active pair."""
 
     def __init__(self):
         """Initialize language service."""

@@ -35,9 +35,9 @@ def test_pipeline():
         translator = get_translation_service()
         print("    ✓ translation service loaded")
 
-        print("  - Loading TTS (pyttsx3)...")
+        print("  - Loading TTS (Piper)...")
         tts = get_tts_service()
-        print("    ✓ pyttsx3 loaded")
+        print("    ✓ Piper loaded")
 
         print("  - Loading Language Service...")
         lang_service = get_language_service()
@@ -60,7 +60,8 @@ def test_pipeline():
         test_sentences = {
             "english": "Hello, how are you today?",
             "german": "Guten Tag, wie geht es dir?",
-            "arabic": "مرحبا كيف حالك؟",
+            "italian": "Ciao, come stai oggi?",
+            "hindi": "नमस्ते, आप आज कैसे हैं?",
         }
 
         for lang, sentence in test_sentences.items():
@@ -109,7 +110,7 @@ def test_pipeline():
         print("ALL TESTS PASSED! ✓")
         print("="*60)
         print("\nPipeline is working correctly!")
-        print("You can now run the GUI with: python -m src.main\n")
+        print("You can now run the terminal app with: python -m src.main\n")
         print(f"Log file: {log_file}")
 
         return True

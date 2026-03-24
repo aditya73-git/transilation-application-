@@ -10,7 +10,7 @@ with open(requirements_path) as f:
 setup(
     name="offline-translator",
     version="0.1.0",
-    description="Push-to-talk offline translator for Raspberry Pi wearable device",
+    description="Terminal-first offline translator for Raspberry Pi wearable device",
     author="Aditya",
     author_email="",
     packages=find_packages(),

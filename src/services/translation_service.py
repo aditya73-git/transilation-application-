@@ -14,7 +14,7 @@ logger = get_logger(__name__)
 
 
 class TranslationService:
-    """Translate between the offline GUI languages."""
+    """Translate between the configured offline languages."""
 
     def __init__(self):
         """Initialize translation service."""
@@ -28,7 +28,7 @@ class TranslationService:
         self.loaded_pipelines = OrderedDict()
 
     def _normalize_language(self, language: str) -> str:
-        """Normalize a language name from the GUI."""
+        """Normalize a language name from the active configuration."""
         return language.lower().strip()
 
     def _get_model_spec(self, source_lang: str, target_lang: str) -> Optional[Dict[str, str]]:
