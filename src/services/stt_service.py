@@ -213,6 +213,7 @@ _stt_instance = None
 def get_stt_service(
     device: Optional[str] = None,
     compute_type: Optional[str] = None,
+    vad_filter: Optional[bool] = None,
     force_reload: bool = False,
 ) -> STTService:
     """Get global STT service instance"""
@@ -222,8 +223,13 @@ def get_stt_service(
         or force_reload
         or (device is not None and _stt_instance.device != device)
         or (compute_type is not None and _stt_instance.compute_type != compute_type)
+        or (vad_filter is not None and _stt_instance.vad_filter != vad_filter)
     ):
         if _stt_instance is not None:
             _stt_instance.unload_model()
-        _stt_instance = STTService(device=device, compute_type=compute_type)
+        _stt_instance = STTService(
+            device=device,
+            compute_type=compute_type,
+            vad_filter=vad_filter,
+        )
     return _stt_instance

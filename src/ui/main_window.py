@@ -2,6 +2,7 @@
 import re
 import sys
 import time
+import soundfile as sf
 from PyQt5.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -20,6 +21,7 @@ from PyQt5.QtWidgets import (
     QSpinBox,
     QDoubleSpinBox,
     QMessageBox,
+    QLineEdit,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt5.QtGui import QFont, QColor, QIcon
@@ -141,6 +143,23 @@ def _finalize_incremental_transcript(pending_text: str, final_tail_text: str) ->
 
     commit_words, leftover_words = _split_committable_words(merged_words, finalize=True)
     return _join_words(commit_words + leftover_words)
+
+
+def _save_stt_debug_audio(audio_data, sample_rate: int, label: str) -> str | None:
+    """Persist the exact audio clip being sent to STT for listening/debugging."""
+    try:
+        debug_dir = Path("logs") / "audio_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        safe_label = re.sub(r"[^a-z0-9_]+", "_", label.lower()).strip("_") or "stt_input"
+        latest_path = debug_dir / f"{safe_label}.wav"
+        archived_path = debug_dir / f"{safe_label}_{time.strftime('%Y%m%d_%H%M%S')}.wav"
+        sf.write(latest_path, audio_data, sample_rate)
+        sf.write(archived_path, audio_data, sample_rate)
+        logger.info("Saved STT debug audio to %s", latest_path)
+        return str(latest_path.resolve())
+    except Exception as e:
+        logger.warning("Failed to save STT debug audio '%s': %s", label, e)
+        return None
 
 
 class RecordingWorker(QThread):
@@ -395,19 +414,40 @@ class StreamingSTTWorker(QThread):
                 return
 
             self.progress.emit("Finalizing transcription...")
-            tail_samples = int(
-                max(
-                    self.partial_window_seconds + self.partial_step_seconds,
-                    self.partial_window_seconds,
+            debug_audio_path = _save_stt_debug_audio(
+                final_audio,
+                self.audio_handler.sample_rate,
+                "last_streaming_stt_input",
+            )
+            if debug_audio_path:
+                self.progress.emit(f"Saved STT input audio: {debug_audio_path}")
+            final_text, _, _ = self.stt_service.transcribe(final_audio, language=self.source_lang_code)
+            if not final_text:
+                tail_samples = int(
+                    max(
+                        self.partial_window_seconds + self.partial_step_seconds,
+                        self.partial_window_seconds,
+                    )
+                    * self.audio_handler.sample_rate
                 )
-                * self.audio_handler.sample_rate
-            )
-            final_tail_audio = final_audio[-tail_samples:] if len(final_audio) > tail_samples else final_audio
-            final_tail_text, _, _ = self.stt_service.transcribe(final_tail_audio, language=self.source_lang_code)
-            final_text = _append_text(
-                self.committed_source_text,
-                _finalize_incremental_transcript(self.pending_source_text, final_tail_text),
-            )
+                final_tail_audio = (
+                    final_audio[-tail_samples:] if len(final_audio) > tail_samples else final_audio
+                )
+                tail_audio_path = _save_stt_debug_audio(
+                    final_tail_audio,
+                    self.audio_handler.sample_rate,
+                    "last_streaming_stt_tail_fallback",
+                )
+                if tail_audio_path:
+                    self.progress.emit(f"Saved STT tail fallback audio: {tail_audio_path}")
+                final_tail_text, _, _ = self.stt_service.transcribe(
+                    final_tail_audio,
+                    language=self.source_lang_code,
+                )
+                final_text = _append_text(
+                    self.committed_source_text,
+                    _finalize_incremental_transcript(self.pending_source_text, final_tail_text),
+                )
             if not final_text:
                 self.error.emit("Failed to recognize speech. Try again.")
                 return
@@ -582,33 +622,52 @@ class StreamingPipelineWorker(QThread):
                 return
 
             self.progress.emit("Finalizing transcription...")
-            final_stt_start = take_perf_sample()
-            tail_samples = int(
-                max(
-                    self.partial_window_seconds + self.partial_step_seconds,
-                    self.partial_window_seconds,
-                )
-                * self.audio_handler.sample_rate
+            debug_audio_path = _save_stt_debug_audio(
+                final_audio,
+                self.audio_handler.sample_rate,
+                "last_streaming_pipeline_stt_input",
             )
-            final_tail_audio = final_audio[-tail_samples:] if len(final_audio) > tail_samples else final_audio
-            final_tail_text, _, _ = self.stt_service.transcribe(final_tail_audio, language=source_lang_code)
+            if debug_audio_path:
+                self.progress.emit(f"Saved STT input audio: {debug_audio_path}")
+            final_stt_start = take_perf_sample()
+            final_text, _, _ = self.stt_service.transcribe(final_audio, language=source_lang_code)
+            if not final_text:
+                tail_samples = int(
+                    max(
+                        self.partial_window_seconds + self.partial_step_seconds,
+                        self.partial_window_seconds,
+                    )
+                    * self.audio_handler.sample_rate
+                )
+                final_tail_audio = (
+                    final_audio[-tail_samples:] if len(final_audio) > tail_samples else final_audio
+                )
+                tail_audio_path = _save_stt_debug_audio(
+                    final_tail_audio,
+                    self.audio_handler.sample_rate,
+                    "last_streaming_pipeline_stt_tail_fallback",
+                )
+                if tail_audio_path:
+                    self.progress.emit(f"Saved STT tail fallback audio: {tail_audio_path}")
+                final_tail_text, _, _ = self.stt_service.transcribe(
+                    final_tail_audio,
+                    language=source_lang_code,
+                )
+                final_text = _append_text(
+                    self.committed_source_text,
+                    _finalize_incremental_transcript(self.pending_source_text, final_tail_text),
+                )
             final_stt_end = take_perf_sample()
-
-            final_tail_source = _finalize_incremental_transcript(self.pending_source_text, final_tail_text)
-            final_text = _append_text(self.committed_source_text, final_tail_source)
             if not final_text:
                 self.error.emit("Failed to recognize speech. Try again.")
                 return
 
             final_translation_start = take_perf_sample()
-            final_translated = self.committed_translation_text
-            if final_tail_source:
-                final_tail_translated = self._translate_for_display(
-                    final_tail_source,
-                    source_lang,
-                    target_lang,
-                )
-                final_translated = _append_text(final_translated, final_tail_translated)
+            final_translated = self._translate_for_display(
+                final_text,
+                source_lang,
+                target_lang,
+            )
             final_translation_end = take_perf_sample()
             if not final_translated:
                 self.error.emit("Translation failed. Try again.")
@@ -617,7 +676,13 @@ class StreamingPipelineWorker(QThread):
             if not self.stt_only and self.auto_play_output:
                 self.progress.emit("Converting to speech...")
                 tts_start = take_perf_sample()
-                if not self.tts_service.speak(final_translated, target_lang):
+                if self.audio_handler.esp_enabled:
+                    ok = self.audio_handler.play_tts_through_esp(
+                        self.tts_service, final_translated, target_lang
+                    )
+                else:
+                    ok = self.tts_service.speak(final_translated, target_lang)
+                if not ok:
                     self.error.emit("Text-to-speech failed.")
                     return
                 tts_end = take_perf_sample()
@@ -736,6 +801,13 @@ class TranslationWorker(QThread):
 
             # Step 1: Speech-to-Text
             self.progress.emit(f"Running speech-to-text for {source_lang}...")
+            debug_audio_path = _save_stt_debug_audio(
+                self.audio_data,
+                self.audio_handler.sample_rate,
+                "last_stt_input",
+            )
+            if debug_audio_path:
+                self.progress.emit(f"Saved STT input audio: {debug_audio_path}")
             stt_start = take_perf_sample()
             text, detected_lang, confidence = self.stt_service.transcribe(
                 self.audio_data,
@@ -790,7 +862,13 @@ class TranslationWorker(QThread):
             if self.auto_play_output:
                 self.progress.emit("Converting to speech...")
                 tts_start = take_perf_sample()
-                if not self.tts_service.speak(translated_text, target_lang):
+                if self.audio_handler.esp_enabled:
+                    ok = self.audio_handler.play_tts_through_esp(
+                        self.tts_service, translated_text, target_lang
+                    )
+                else:
+                    ok = self.tts_service.speak(translated_text, target_lang)
+                if not ok:
                     self.error.emit("Text-to-speech failed.")
                     return
                 tts_end = take_perf_sample()
@@ -914,6 +992,20 @@ class SettingsDialog(QDialog):
         self.connectivity_interval_spin.setSuffix(" s")
         form.addRow("Connectivity check", self.connectivity_interval_spin)
 
+        self.esp_enable_checkbox = QCheckBox("Use ReSpeaker ESP (WiFi mic + speaker)")
+        self.esp_enable_checkbox.setChecked(settings.get("esp_enabled", False))
+        form.addRow("ESP bridge", self.esp_enable_checkbox)
+        self.esp_host_edit = QLineEdit(settings.get("esp_host", "10.42.0.27"))
+        form.addRow("ESP IP / host", self.esp_host_edit)
+        self.esp_mic_port_spin = QSpinBox()
+        self.esp_mic_port_spin.setRange(1024, 65535)
+        self.esp_mic_port_spin.setValue(int(settings.get("esp_mic_port", 12346)))
+        form.addRow("ESP mic TCP port", self.esp_mic_port_spin)
+        self.esp_play_port_spin = QSpinBox()
+        self.esp_play_port_spin.setRange(1024, 65535)
+        self.esp_play_port_spin.setValue(int(settings.get("esp_play_port", 12345)))
+        form.addRow("ESP playback TCP port", self.esp_play_port_spin)
+
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -935,6 +1027,10 @@ class SettingsDialog(QDialog):
             "partial_step_seconds": self.partial_step_spin.value(),
             "partial_window_seconds": self.partial_window_spin.value(),
             "connectivity_interval": self.connectivity_interval_spin.value(),
+            "esp_enabled": self.esp_enable_checkbox.isChecked(),
+            "esp_host": self.esp_host_edit.text().strip(),
+            "esp_mic_port": self.esp_mic_port_spin.value(),
+            "esp_play_port": self.esp_play_port_spin.value(),
         }
 
 
@@ -959,7 +1055,10 @@ class MainWindow(QMainWindow):
         self.language_service = get_language_service()
         self.connectivity_service = get_connectivity_service()
         self.claude_client = get_claude_client()
-        self.audio_handler = AudioHandler(sample_rate=16000)
+        self.audio_handler = AudioHandler(
+            sample_rate=16000,
+            esp_config=self.config.get_esp_config(),
+        )
         self.cache = TranslationCache(db_path="cache.db")
         self.audio_config = self.config.get_audio_config()
         self.stt_model_name = whisper_config.get("model", "base")
@@ -1535,6 +1634,10 @@ class MainWindow(QMainWindow):
                 "partial_step_seconds": self.partial_step_seconds,
                 "partial_window_seconds": self.partial_window_seconds,
                 "connectivity_interval": self.connectivity_interval,
+                "esp_enabled": self.audio_handler.esp_enabled,
+                "esp_host": self.audio_handler.esp_host,
+                "esp_mic_port": self.audio_handler.esp_mic_port,
+                "esp_play_port": self.audio_handler.esp_play_port,
             },
             self,
         )
@@ -1580,9 +1683,20 @@ class MainWindow(QMainWindow):
                 "ui.live_partial_window": self.partial_window_seconds,
                 "ui.connectivity_interval": self.connectivity_interval,
                 "audio.max_duration": settings["max_duration"],
+                "esp.enabled": settings["esp_enabled"],
+                "esp.host": settings["esp_host"],
+                "esp.mic_port": settings["esp_mic_port"],
+                "esp.playback_port": settings["esp_play_port"],
             },
             persist=True,
         )
+
+        self.audio_handler.esp_enabled = bool(
+            settings["esp_enabled"] and settings["esp_host"].strip()
+        )
+        self.audio_handler.esp_host = settings["esp_host"].strip()
+        self.audio_handler.esp_mic_port = int(settings["esp_mic_port"])
+        self.audio_handler.esp_play_port = int(settings["esp_play_port"])
 
         desired_compute_type = self._get_stt_compute_type_for_device(self.stt_device)
         if self.stt_service is not None:
@@ -1639,6 +1753,12 @@ class MainWindow(QMainWindow):
             return self.stt_gpu_compute_type
         return self.stt_cpu_compute_type
 
+    def _get_effective_stt_vad_filter(self) -> bool:
+        """Disable Whisper VAD for ESP input because the ReSpeaker already filters speech."""
+        if self.audio_handler.esp_enabled:
+            return False
+        return self.stt_vad_filter
+
     def _start_stt_benchmark(self):
         """Run an optional STT CPU/GPU benchmark on the latest audio clip."""
         if not self.pending_stt_benchmark or self.stt_benchmark_worker is not None:
@@ -1657,7 +1777,7 @@ class MainWindow(QMainWindow):
             self.stt_cpu_threads,
             self.stt_num_workers,
             self.stt_beam_size,
-            self.stt_vad_filter,
+            self._get_effective_stt_vad_filter(),
         )
         self.stt_benchmark_worker.progress.connect(self._on_progress)
         self.stt_benchmark_worker.work_finished.connect(self._on_stt_benchmark_finished)
@@ -1685,11 +1805,13 @@ class MainWindow(QMainWindow):
         """Load only the services needed for the current test stage."""
         errors = []
         desired_compute_type = self._get_stt_compute_type_for_device(self.stt_device)
+        desired_vad_filter = self._get_effective_stt_vad_filter()
 
         if (
             self.stt_service is None
             or self.stt_service.device != self.stt_device
             or self.stt_service.compute_type != desired_compute_type
+            or self.stt_service.vad_filter != desired_vad_filter
         ):
             try:
                 self.status_label.setText("Loading STT...")
@@ -1698,10 +1820,15 @@ class MainWindow(QMainWindow):
                 self.stt_service = get_stt_service(
                     device=self.stt_device,
                     compute_type=desired_compute_type,
+                    vad_filter=desired_vad_filter,
                     force_reload=self.stt_service is not None,
                 )
                 load_end = take_perf_sample()
                 self._log(format_stage_metrics("STT load", load_start, load_end))
+                self._log(
+                    "STT VAD filter: "
+                    + ("disabled for ReSpeaker ESP input" if not desired_vad_filter and self.audio_handler.esp_enabled else str(desired_vad_filter))
+                )
             except Exception as e:
                 logger.error(f"Failed to initialize STT service: {e}")
                 errors.append(f"Speech-to-text unavailable: {e}")

@@ -2,6 +2,7 @@
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
@@ -37,8 +38,22 @@ ARECORD_AVAILABLE = shutil.which("arecord") is not None
 class AudioHandler:
     """Handle microphone recording and speaker playback (with fallback for dev mode)"""
 
-    def __init__(self, sample_rate=16000):
+    def __init__(self, sample_rate=16000, esp_config=None):
         self.sample_rate = sample_rate
+        esp_config = esp_config or {}
+        self.esp_enabled = bool(esp_config.get("enabled")) and bool(
+            (esp_config.get("host") or "").strip()
+        )
+        self.esp_host = (esp_config.get("host") or "").strip()
+        self.esp_mic_port = int(esp_config.get("mic_port", 12346))
+        self.esp_play_port = int(esp_config.get("playback_port", 12345))
+        self.esp_mic_sample_width = int(esp_config.get("mic_sample_width", 4))
+        if self.esp_mic_sample_width not in (2, 4):
+            logger.warning("Unsupported ESP mic sample width %s; defaulting to 4", self.esp_mic_sample_width)
+            self.esp_mic_sample_width = 4
+        if esp_config.get("enabled") and not self.esp_host:
+            logger.warning("ESP enabled but host empty; ESP audio disabled")
+
         self.audio_data = None
         self.is_recording = False
         self.recording_process = None
@@ -95,6 +110,9 @@ class AudioHandler:
         with self.stream_buffer_lock:
             self.stream_buffer = bytearray()
 
+        if self.esp_enabled:
+            self._start_esp_mic_stream()
+            return
         if self.use_mock:
             self._start_mock_stream()
             return
@@ -109,7 +127,7 @@ class AudioHandler:
 
     def get_recording_snapshot(self):
         """Get the currently buffered recording as float32 mono audio."""
-        if self.use_mock or self.use_sounddevice:
+        if self.esp_enabled or self.use_mock or self.use_sounddevice:
             with self.stream_buffer_lock:
                 buffer_copy = bytes(self.stream_buffer)
             if not buffer_copy:
@@ -121,6 +139,54 @@ class AudioHandler:
         if not buffer_copy:
             return np.array([], dtype=np.float32)
         return self._pcm16_bytes_to_float32(buffer_copy)
+
+    def _start_esp_mic_stream(self):
+        """TCP mic stream from ESP (16/32-bit stereo LE @ sample_rate) -> float32 mono buffer."""
+        from src.utils.esp_audio_transport import pcm_stereo_bytes_to_mono_float32
+
+        logger.info(
+            "ESP mic stream: tcp://%s:%s (%s-bit stereo)",
+            self.esp_host,
+            self.esp_mic_port,
+            self.esp_mic_sample_width * 8,
+        )
+
+        def reader():
+            try:
+                sock = socket.create_connection((self.esp_host, self.esp_mic_port), timeout=10)
+            except OSError as e:
+                logger.error("ESP mic connect failed: %s", e)
+                return
+            sock.settimeout(0.35)
+            partial = bytearray()
+            try:
+                while self.is_recording:
+                    try:
+                        data = sock.recv(8192)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        break
+                    partial.extend(data)
+                    frame_bytes = self.esp_mic_sample_width * 2
+                    take = len(partial) - (len(partial) % frame_bytes)
+                    if take == 0:
+                        continue
+                    block = bytes(partial[:take])
+                    del partial[:take]
+                    mono = pcm_stereo_bytes_to_mono_float32(block, self.esp_mic_sample_width)
+                    if mono.size == 0:
+                        continue
+                    with self.stream_buffer_lock:
+                        self.stream_buffer.extend(mono.astype(np.float32).tobytes())
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        self.stream_reader_thread = threading.Thread(target=reader, daemon=True)
+        self.stream_reader_thread.start()
 
     def stop_stream_recording(self):
         """Stop streaming capture and return the final buffered audio."""
@@ -163,6 +229,8 @@ class AudioHandler:
         Returns:
             numpy array of audio data
         """
+        if self.esp_enabled:
+            return self._record_audio_esp(duration, threshold, silence_duration)
         if self.use_mock:
             return self._mock_record_audio(duration)
         if self.use_pw_record:
@@ -217,6 +285,76 @@ class AudioHandler:
         except Exception as e:
             logger.error(f"Recording error: {e}")
             return None
+
+    def _record_audio_esp(self, duration=None, threshold=0.02, silence_duration=0.5):
+        """Push-to-talk recording from ESP TCP mic (16/32-bit stereo)."""
+        from src.utils.esp_audio_transport import pcm_stereo_bytes_to_mono_float32
+
+        if not self.esp_host:
+            logger.error("ESP host not set")
+            return np.array([], dtype=np.float32)
+
+        try:
+            sock = socket.create_connection((self.esp_host, self.esp_mic_port), timeout=15)
+        except OSError as e:
+            logger.error("ESP mic connect failed: %s", e)
+            return None
+
+        sock.settimeout(0.35)
+        logger.info("Recording from ESP mic (%s-bit stereo)...", self.esp_mic_sample_width * 8)
+        chunks = []
+        partial = bytearray()
+        chunk_samples = int(self.sample_rate * 0.1)
+        stereo_frame_bytes = self.esp_mic_sample_width * 2
+        frame_bytes = chunk_samples * stereo_frame_bytes
+        silence_samples = int(self.sample_rate * silence_duration)
+        silence_count = 0
+
+        try:
+            while self.is_recording:
+                try:
+                    data = sock.recv(max(frame_bytes, 4096))
+                except socket.timeout:
+                    continue
+                if not data:
+                    break
+                partial.extend(data)
+                take = len(partial) - (len(partial) % stereo_frame_bytes)
+                if take == 0:
+                    continue
+                block = bytes(partial[:take])
+                del partial[:take]
+                mono = pcm_stereo_bytes_to_mono_float32(block, self.esp_mic_sample_width)
+                if mono.size == 0:
+                    continue
+                chunks.append(mono)
+
+                amplitude = float(np.max(np.abs(mono))) if mono.size else 0.0
+                if amplitude < threshold:
+                    silence_count += mono.size
+                    if silence_count > silence_samples and len(chunks) > 5:
+                        logger.info("Silence detected (ESP), stopping recording")
+                        break
+                else:
+                    silence_count = 0
+
+                if duration and sum(len(c) for c in chunks) > self.sample_rate * duration:
+                    logger.info("Max duration reached (ESP)")
+                    break
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        if not chunks:
+            logger.warning("No ESP mic data captured")
+            return np.array([], dtype=np.float32)
+
+        audio_data = np.concatenate(chunks)
+        self.audio_data = audio_data
+        logger.info("ESP recording complete. Duration: %.2fs", len(audio_data) / self.sample_rate)
+        return audio_data
 
     def _start_pw_record_stream(self):
         """Start PipeWire recording to stdout for streaming STT."""
@@ -548,6 +686,31 @@ class AudioHandler:
         self.is_recording = False
         if self.recording_process and self.recording_process.poll() is None:
             self.recording_process.send_signal(signal.SIGINT)
+
+    def play_wav_file_to_esp(self, wav_path) -> bool:
+        """Send a WAV file to the ESP playback TCP port (16 kHz stereo int16)."""
+        if not self.esp_enabled:
+            logger.warning("play_wav_file_to_esp called but ESP disabled")
+            return False
+        from src.utils.esp_audio_transport import stream_wav_to_esp
+
+        return stream_wav_to_esp(self.esp_host, self.esp_play_port, wav_path)
+
+    def play_tts_through_esp(self, tts_service, text: str, language: str) -> bool:
+        """Synthesize TTS to a temp WAV and stream it to the ESP speaker."""
+        if not text.strip():
+            return False
+        fd, path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            if not tts_service.speak(text, language, output_file=path):
+                return False
+            return self.play_wav_file_to_esp(path)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def play_audio(self, audio_data, blocking=True):
         """

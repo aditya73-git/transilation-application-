@@ -131,6 +131,12 @@ audio:
   max_duration: 60
   silence_threshold: 0.01
   silence_duration: 0.5
+esp:
+  enabled: false
+  host: 10.42.0.27
+  mic_port: 12346
+  playback_port: 12345
+  mic_sample_width: 4
 device:
   device_name: OfflineTranslator
   timezone: UTC
