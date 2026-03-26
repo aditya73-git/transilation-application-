@@ -25,23 +25,30 @@ class TranslationCache:
                     source_text TEXT NOT NULL,
                     source_lang TEXT NOT NULL,
                     target_lang TEXT NOT NULL,
+                    translation_mode TEXT NOT NULL DEFAULT 'default',
                     translated_text TEXT NOT NULL,
                     confidence REAL,
                     cloud_refined TEXT,
                     timestamp REAL NOT NULL,
-                    UNIQUE(source_text, source_lang, target_lang)
+                    UNIQUE(source_text, source_lang, target_lang, translation_mode)
                 )
                 """
             )
+            cursor.execute("PRAGMA table_info(translations)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "translation_mode" not in columns:
+                cursor.execute(
+                    "ALTER TABLE translations ADD COLUMN translation_mode TEXT NOT NULL DEFAULT 'default'"
+                )
             cursor.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_langs
-                ON translations(source_lang, target_lang)
+                ON translations(source_lang, target_lang, translation_mode)
                 """
             )
             conn.commit()
 
-    def get(self, source_text, source_lang, target_lang):
+    def get(self, source_text, source_lang, target_lang, translation_mode="default"):
         """
         Get cached translation
 
@@ -54,9 +61,9 @@ class TranslationCache:
                 """
                 SELECT translated_text, confidence, cloud_refined
                 FROM translations
-                WHERE source_text = ? AND source_lang = ? AND target_lang = ?
+                WHERE source_text = ? AND source_lang = ? AND target_lang = ? AND translation_mode = ?
                 """,
-                (source_text, source_lang, target_lang),
+                (source_text, source_lang, target_lang, translation_mode),
             )
             result = cursor.fetchone()
 
@@ -68,9 +75,9 @@ class TranslationCache:
                 }
             return None
 
-    def get_best(self, source_text, source_lang, target_lang):
+    def get_best(self, source_text, source_lang, target_lang, translation_mode="default"):
         """Get the best cached translation, preferring cloud-refined text when present."""
-        cached = self.get(source_text, source_lang, target_lang)
+        cached = self.get(source_text, source_lang, target_lang, translation_mode=translation_mode)
         if not cached:
             return None
 
@@ -82,21 +89,44 @@ class TranslationCache:
             "base_translation": cached["translated_text"],
         }
 
-    def set(self, source_text, source_lang, target_lang, translated_text, confidence=0.95):
+    def set(
+        self,
+        source_text,
+        source_lang,
+        target_lang,
+        translated_text,
+        confidence=0.95,
+        translation_mode="default",
+    ):
         """Cache a translation"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 INSERT OR REPLACE INTO translations
-                (source_text, source_lang, target_lang, translated_text, confidence, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (source_text, source_lang, target_lang, translation_mode, translated_text, confidence, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (source_text, source_lang, target_lang, translated_text, confidence, time.time()),
+                (
+                    source_text,
+                    source_lang,
+                    target_lang,
+                    translation_mode,
+                    translated_text,
+                    confidence,
+                    time.time(),
+                ),
             )
             conn.commit()
 
-    def set_cloud_refinement(self, source_text, source_lang, target_lang, cloud_refined):
+    def set_cloud_refinement(
+        self,
+        source_text,
+        source_lang,
+        target_lang,
+        cloud_refined,
+        translation_mode="default",
+    ):
         """Update cache with cloud-refined translation"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -104,9 +134,9 @@ class TranslationCache:
                 """
                 UPDATE translations
                 SET cloud_refined = ?
-                WHERE source_text = ? AND source_lang = ? AND target_lang = ?
+                WHERE source_text = ? AND source_lang = ? AND target_lang = ? AND translation_mode = ?
                 """,
-                (cloud_refined, source_text, source_lang, target_lang),
+                (cloud_refined, source_text, source_lang, target_lang, translation_mode),
             )
             conn.commit()
 
@@ -153,12 +183,15 @@ class TranslationCache:
             count = cursor.fetchone()[0]
 
             cursor.execute(
-                "SELECT DISTINCT source_lang, target_lang FROM translations ORDER BY source_lang"
+                "SELECT DISTINCT source_lang, target_lang, translation_mode FROM translations ORDER BY source_lang"
             )
             language_pairs = cursor.fetchall()
 
         return {
             "total_entries": count,
             "size_mb": self.get_size(),
-            "language_pairs": [{"source": pair[0], "target": pair[1]} for pair in language_pairs],
+            "language_pairs": [
+                {"source": pair[0], "target": pair[1], "mode": pair[2]}
+                for pair in language_pairs
+            ],
         }

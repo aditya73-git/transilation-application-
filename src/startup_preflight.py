@@ -49,13 +49,20 @@ def resolve_whisper_repo_id(model_name: str) -> str:
 
 def _required_translation_model_ids(config) -> List[str]:
     """Collect unique translation repo ids from config."""
-    model_specs = config.get_translation_config().get("models", {})
+    translation_config = config.get_translation_config()
+    model_specs = translation_config.get("models", {})
     model_ids = []
     for targets in model_specs.values():
         for spec in targets.values():
             model_id = spec.get("model")
             if model_id and model_id not in model_ids:
                 model_ids.append(model_id)
+    m2m_model = translation_config.get("m2m_model")
+    if m2m_model and m2m_model not in model_ids:
+        model_ids.append(m2m_model)
+    quality_model = translation_config.get("quality_model")
+    if quality_model and quality_model not in model_ids:
+        model_ids.append(quality_model)
     return model_ids
 
 

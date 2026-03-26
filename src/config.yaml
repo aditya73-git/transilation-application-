@@ -29,10 +29,31 @@ offline:
   whisper_num_workers: 1
   whisper_beam_size: 1
   whisper_vad_filter: true
+  translation_mode: balanced
   translation_strategy: pivot_english
   translation_pivot_language: english
   translation_device: cpu
   translation_max_loaded_models: 4
+  translation_m2m_model: facebook/m2m100_418M
+  translation_m2m_language_codes:
+    english: en
+    german: de
+    arabic: ar
+    romanian: ro
+    slovakian: sk
+    turkish: tr
+    polish: pl
+    italian: it
+  translation_quality_model: facebook/nllb-200-distilled-600M
+  translation_quality_language_codes:
+    english: eng_Latn
+    german: deu_Latn
+    arabic: arb_Arab
+    romanian: ron_Latn
+    slovakian: slk_Latn
+    turkish: tur_Latn
+    polish: pol_Latn
+    italian: ita_Latn
   translation_models:
     english:
       german:
@@ -137,7 +158,7 @@ esp:
   ble_device_name: ReSpeaker-BLE-Audio
   ble_device_address: ''
   ble_scan_timeout: 8.0
-  host: 192.168.245.152
+  host: 192.168.220.152
   mic_port: 12346
   playback_port: 12345
   button_port: 12347
@@ -163,7 +184,7 @@ ui:
   audio_log_enabled: true
   stt_only_mode: false
   live_streaming: false
-  conversation_mode: true
+  conversation_mode: false
   stt_benchmark_cpu_gpu: false
   live_partial_interval: 1.0
   live_partial_step: 2.0

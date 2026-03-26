@@ -747,13 +747,20 @@ class StreamingPipelineWorker(QThread):
         if self.stt_only:
             return "STT-only mode: translation skipped"
 
-        cached = self.cache.get_best(text, source_lang, target_lang)
+        cache_mode = self.translation_service.get_cache_namespace()
+        cached = self.cache.get_best(text, source_lang, target_lang, translation_mode=cache_mode)
         if cached:
             return cached["translated_text"]
 
         translated_text, _ = self.translation_service.translate(text, source_lang, target_lang)
         if translated_text:
-            self.cache.set(text, source_lang, target_lang, translated_text)
+            self.cache.set(
+                text,
+                source_lang,
+                target_lang,
+                translated_text,
+                translation_mode=cache_mode,
+            )
         return translated_text
 
     def _emit_partial_display(self):
@@ -965,7 +972,12 @@ class StreamingPipelineWorker(QThread):
                 self.progress.emit(format_stage_metrics("TTS", tts_start, tts_end))
             self.progress.emit(format_stage_metrics("Pipeline total", pipeline_start, pipeline_end))
 
-            cached = self.cache.get_best(final_text, source_lang, target_lang)
+            cached = self.cache.get_best(
+                final_text,
+                source_lang,
+                target_lang,
+                translation_mode=self.translation_service.get_cache_namespace(),
+            )
             if self.claude_client.is_enabled() and not (cached and cached["cloud_refined"]):
                 self.progress.emit("Queuing for cloud refinement...")
                 refine_started = time.time()
@@ -1074,9 +1086,10 @@ class TranslationWorker(QThread):
 
             # Step 2: Translation
             self.progress.emit("Translating...")
+            cache_mode = self.translation_service.get_cache_namespace()
 
             # Check cache first
-            cached = self.cache.get_best(text, source_lang, target_lang)
+            cached = self.cache.get_best(text, source_lang, target_lang, translation_mode=cache_mode)
             if cached:
                 translated_text = cached["translated_text"]
                 if cached["cloud_refined"]:
@@ -1093,7 +1106,13 @@ class TranslationWorker(QThread):
                     return
 
                 # Cache the translation
-                self.cache.set(text, source_lang, target_lang, translated_text)
+                self.cache.set(
+                    text,
+                    source_lang,
+                    target_lang,
+                    translated_text,
+                    translation_mode=cache_mode,
+                )
             if cached:
                 translation_start = take_perf_sample()
                 translation_end = translation_start
@@ -1184,6 +1203,14 @@ class SettingsDialog(QDialog):
         index = self.stt_device_combo.findData(settings["stt_device"])
         self.stt_device_combo.setCurrentIndex(index if index >= 0 else 0)
         form.addRow("STT device", self.stt_device_combo)
+
+        self.translation_mode_combo = QComboBox()
+        self.translation_mode_combo.addItem("Fast (Marian)", "fast")
+        self.translation_mode_combo.addItem("Balanced (M2M100)", "balanced")
+        self.translation_mode_combo.addItem("Quality (NLLB)", "quality")
+        index = self.translation_mode_combo.findData(settings["translation_mode"])
+        self.translation_mode_combo.setCurrentIndex(index if index >= 0 else 2)
+        form.addRow("Translation mode", self.translation_mode_combo)
 
         self.stt_benchmark_checkbox = QCheckBox("Benchmark same audio on CPU and GPU after each run")
         self.stt_benchmark_checkbox.setChecked(settings["stt_benchmark_cpu_gpu"])
@@ -1314,6 +1341,7 @@ class SettingsDialog(QDialog):
         return {
             "stt_only_mode": self.stt_only_checkbox.isChecked(),
             "stt_device": self.stt_device_combo.currentData(),
+            "translation_mode": self.translation_mode_combo.currentData(),
             "stt_benchmark_cpu_gpu": self.stt_benchmark_checkbox.isChecked(),
             "live_streaming": self.live_streaming_checkbox.isChecked(),
             "auto_play_output": self.auto_play_checkbox.isChecked(),
@@ -1368,6 +1396,7 @@ class MainWindow(QMainWindow):
         self.audio_config = self.config.get_audio_config()
         self.stt_model_name = whisper_config.get("model", "base")
         self.stt_device = self.config.get("offline.whisper_device", whisper_config.get("device", "cpu"))
+        self.translation_mode = self.config.get("offline.translation_mode", "quality")
         self.stt_cpu_compute_type = whisper_config.get("compute_type", "int8")
         self.stt_gpu_compute_type = whisper_config.get("gpu_compute_type", "float16")
         self.stt_cpu_threads = whisper_config.get("cpu_threads", 0)
@@ -1618,15 +1647,39 @@ class MainWindow(QMainWindow):
         self._update_esp_status_display()
 
     def _on_esp_button_event(self, event: str):
-        """Map a hardware button press onto the GUI's toggle button."""
-        if event != "PRESS":
+        """Map hardware control events onto the GUI."""
+        if event == "PRESS":
+            self.ptt_button.click()
             return
-        self.ptt_button.click()
+        if not event.startswith("DIAL "):
+            return
+        try:
+            raw_value = int(event.split(maxsplit=1)[1], 10)
+        except (IndexError, ValueError):
+            logger.warning("Ignoring malformed ESP dial event: %s", event)
+            return
+        self._apply_dial_language_value(raw_value)
 
     def _on_esp_connection_changed(self, connected: bool):
         """Update GUI status when the ESP button socket connects or drops."""
         self.esp_bridge_connected = connected
         self._update_esp_status_display()
+
+    def _apply_dial_language_value(self, raw_value: int):
+        """Map the Step16 dial position onto a target language selection."""
+        supported = self.language_service.get_supported_languages()
+        if not supported:
+            return
+
+        source, _ = self.language_service.get_current_pair()
+        target = supported[raw_value % len(supported)]
+        if target == source:
+            target = supported[(raw_value + 1) % len(supported)]
+
+        self._apply_language_selection(source, target, changed="target")
+        self.statusBar().showMessage(
+            f"ESP dial selected target language: {target.capitalize()} (dial {raw_value})"
+        )
 
     def _on_ptt_clicked(self, checked: bool):
         """Toggle recording on/off with a single button."""
@@ -2071,7 +2124,14 @@ class MainWindow(QMainWindow):
         elapsed: str,
     ):
         """Handle async cloud refinement on the GUI thread."""
-        self.cache.set_cloud_refinement(source_text, source_lang, target_lang, refined_text)
+        cache_mode = self.translation_service.get_cache_namespace() if self.translation_service else "default"
+        self.cache.set_cloud_refinement(
+            source_text,
+            source_lang,
+            target_lang,
+            refined_text,
+            translation_mode=cache_mode,
+        )
         if self.source_text.toPlainText().strip() == source_text.strip():
             self.translated_text.setText(refined_text)
         self._log(f"Cloud refinement complete in {elapsed}")
@@ -2186,6 +2246,7 @@ class MainWindow(QMainWindow):
             {
                 "stt_only_mode": self.stt_only_mode,
                 "stt_device": self.stt_device,
+                "translation_mode": self.translation_mode,
                 "stt_benchmark_cpu_gpu": self.stt_benchmark_cpu_gpu,
                 "live_streaming": self.live_streaming_enabled,
                 "auto_play_output": self.auto_play_output,
@@ -2223,6 +2284,7 @@ class MainWindow(QMainWindow):
 
         self.stt_only_mode = settings["stt_only_mode"]
         self.stt_device = settings["stt_device"]
+        self.translation_mode = settings["translation_mode"]
         self.stt_benchmark_cpu_gpu = settings["stt_benchmark_cpu_gpu"]
         self.live_streaming_enabled = settings["live_streaming"]
         self.auto_play_output = settings["auto_play_output"]
@@ -2244,6 +2306,7 @@ class MainWindow(QMainWindow):
         self.config.update(
             {
                 "offline.whisper_device": self.stt_device,
+                "offline.translation_mode": self.translation_mode,
                 "ui.stt_only_mode": self.stt_only_mode,
                 "ui.stt_benchmark_cpu_gpu": self.stt_benchmark_cpu_gpu,
                 "ui.live_streaming": self.live_streaming_enabled,
@@ -2295,6 +2358,15 @@ class MainWindow(QMainWindow):
                 self._log(
                     f"STT backend set to {self.stt_device} ({desired_compute_type}); model will reload on next use"
                 )
+
+        if self.translation_service is not None:
+            try:
+                self.translation_service.set_mode(self.translation_mode)
+                self._log(f"Translation mode set to {self.translation_mode}")
+                if not self.stt_only_mode:
+                    self._start_translation_warmup(force=True)
+            except Exception as e:
+                self._log(f"ERROR: Failed to switch translation mode: {e}")
 
         self.status_label.setText("STT Ready" if self.stt_only_mode else "Ready")
         self.statusBar().showMessage("Settings updated")
@@ -2483,11 +2555,18 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("Loading translation model...")
                 load_start = take_perf_sample()
                 self.translation_service = get_translation_service()
+                self.translation_service.set_mode(self.translation_mode)
                 load_end = take_perf_sample()
                 self._log(format_stage_metrics("Translation load", load_start, load_end))
             except Exception as e:
                 logger.error(f"Failed to initialize translation service: {e}")
                 errors.append(f"Translation unavailable: {e}")
+        else:
+            try:
+                self.translation_service.set_mode(self.translation_mode)
+            except Exception as e:
+                logger.error(f"Failed to apply translation mode: {e}")
+                errors.append(f"Translation mode unavailable: {e}")
 
         if self.auto_play_output and self.tts_service is None:
             try:

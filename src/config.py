@@ -131,12 +131,30 @@ class Config:
 
     def get_translation_config(self):
         """Get translation model configuration."""
+        language_codes = self.config.get("languages", {}).get("code_mappings", {})
         return {
+            "mode": self.config.get("offline", {}).get("translation_mode", "quality"),
             "strategy": self.config.get("offline", {}).get("translation_strategy", "pivot_english"),
             "pivot_language": self.config.get("offline", {}).get("translation_pivot_language", "english"),
             "device": self.config.get("offline", {}).get("translation_device", "cpu"),
             "max_loaded_models": self.config.get("offline", {}).get("translation_max_loaded_models", 2),
             "models": self.config.get("offline", {}).get("translation_models", {}),
+            "m2m_model": self.config.get("offline", {}).get(
+                "translation_m2m_model",
+                "facebook/m2m100_418M",
+            ),
+            "m2m_language_codes": self.config.get("offline", {}).get(
+                "translation_m2m_language_codes",
+                language_codes,
+            ),
+            "quality_model": self.config.get("offline", {}).get(
+                "translation_quality_model",
+                "facebook/nllb-200-distilled-600M",
+            ),
+            "quality_language_codes": self.config.get("offline", {}).get(
+                "translation_quality_language_codes",
+                {},
+            ),
         }
 
     def get_m2m_model(self):

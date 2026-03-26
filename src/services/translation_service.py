@@ -1,4 +1,4 @@
-"""Translation service using lighter Marian/OPUS models with English pivoting."""
+"""Translation service with Marian, M2M100, and NLLB backends."""
 from collections import OrderedDict
 import gc
 import threading
@@ -22,10 +22,15 @@ class TranslationService:
         config = get_config()
         self.config = config.get_translation_config()
         self.device = self.config.get("device", "cpu")
+        self.mode = self.config.get("mode", "quality")
         self.strategy = self.config.get("strategy", "pivot_english")
         self.pivot_language = self.config.get("pivot_language", "english").lower().strip()
         self.max_loaded_models = max(1, int(self.config.get("max_loaded_models", 2)))
         self.model_specs = self.config.get("models", {})
+        self.m2m_model_name = self.config.get("m2m_model", "facebook/m2m100_418M")
+        self.m2m_language_codes = self.config.get("m2m_language_codes", {})
+        self.quality_model_name = self.config.get("quality_model", "facebook/nllb-200-distilled-600M")
+        self.quality_language_codes = self.config.get("quality_language_codes", {})
         self.loaded_pipelines = OrderedDict()
         self._load_lock = threading.RLock()
 
@@ -73,6 +78,86 @@ class TranslationService:
             logger.info("Translation model ready on %s", self.device)
             return tokenizer, model
 
+    def _m2m_lang_code(self, language: str) -> str:
+        """Return the M2M100 language code for one GUI language."""
+        language = self._normalize_language(language)
+        code = self.m2m_language_codes.get(language)
+        if not code:
+            raise ValueError(f"No M2M100 translation code configured for {language}")
+        return code
+
+    def _translate_m2m(self, text: str, source_lang: str, target_lang: str) -> str:
+        """Translate with M2M100."""
+        tokenizer, model = self._load_pipeline(self.m2m_model_name)
+        source_code = self._m2m_lang_code(source_lang)
+        target_code = self._m2m_lang_code(target_lang)
+
+        tokenizer.src_lang = source_code
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        ).to(self.device)
+
+        forced_bos_token_id = tokenizer.get_lang_id(target_code)
+
+        with torch.no_grad():
+            generated_tokens = model.generate(
+                **inputs,
+                forced_bos_token_id=forced_bos_token_id,
+                max_length=512,
+                num_beams=4,
+            )
+
+        return tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0].strip()
+
+    def _quality_lang_code(self, language: str) -> str:
+        """Return the NLLB language code for one GUI language."""
+        language = self._normalize_language(language)
+        code = self.quality_language_codes.get(language)
+        if not code:
+            raise ValueError(f"No quality translation code configured for {language}")
+        return code
+
+    def _translate_quality(self, text: str, source_lang: str, target_lang: str) -> str:
+        """Translate with the higher-quality NLLB model."""
+        tokenizer, model = self._load_pipeline(self.quality_model_name)
+        source_code = self._quality_lang_code(source_lang)
+        target_code = self._quality_lang_code(target_lang)
+
+        tokenizer.src_lang = source_code
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+        ).to(self.device)
+
+        forced_bos_token_id = None
+        if hasattr(tokenizer, "lang_code_to_id") and target_code in tokenizer.lang_code_to_id:
+            forced_bos_token_id = tokenizer.lang_code_to_id[target_code]
+        else:
+            forced_bos_token_id = tokenizer.convert_tokens_to_ids(target_code)
+
+        with torch.no_grad():
+            generated_tokens = model.generate(
+                **inputs,
+                forced_bos_token_id=forced_bos_token_id,
+                max_length=512,
+                num_beams=4,
+            )
+
+        return tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0].strip()
+
+    def get_cache_namespace(self) -> str:
+        """Return a cache namespace for the active translation backend."""
+        if self.mode == "balanced":
+            return f"balanced:{self.m2m_model_name}"
+        if self.mode == "quality":
+            return f"quality:{self.quality_model_name}"
+        return "fast:marian"
+
     def get_route_model_names(self, source_lang: str, target_lang: str) -> list[str]:
         """Return the direct or pivot model ids needed for one pair."""
         source_lang = self._normalize_language(source_lang)
@@ -80,6 +165,16 @@ class TranslationService:
 
         if source_lang == target_lang:
             return []
+
+        if self.mode == "balanced":
+            self._m2m_lang_code(source_lang)
+            self._m2m_lang_code(target_lang)
+            return [self.m2m_model_name]
+
+        if self.mode == "quality":
+            self._quality_lang_code(source_lang)
+            self._quality_lang_code(target_lang)
+            return [self.quality_model_name]
 
         direct = self._get_model_spec(source_lang, target_lang)
         if direct is not None:
@@ -151,7 +246,13 @@ class TranslationService:
 
             logger.info("Translating (%s -> %s): %s...", source_lang, target_lang, text[:50])
 
-            if self._get_model_spec(source_lang, target_lang):
+            if self.mode == "balanced":
+                translated_text = self._translate_m2m(text, source_lang, target_lang)
+                confidence = 0.89
+            elif self.mode == "quality":
+                translated_text = self._translate_quality(text, source_lang, target_lang)
+                confidence = 0.92
+            elif self._get_model_spec(source_lang, target_lang):
                 translated_text = self._translate_direct(text, source_lang, target_lang)
                 confidence = 0.85
             else:
@@ -200,6 +301,16 @@ class TranslationService:
         self.device = device
         self.unload_model()
         logger.info("Translation service moved to %s", device)
+
+    def set_mode(self, mode: str):
+        """Switch translation backend mode and clear loaded models."""
+        mode = mode.lower().strip()
+        if mode not in {"fast", "balanced", "quality"}:
+            raise ValueError(f"Unsupported translation mode: {mode}")
+        if self.mode != mode:
+            self.mode = mode
+            self.unload_model()
+            logger.info("Translation mode switched to %s", mode)
 
     def unload_model(self):
         """Unload translation models to free memory."""
