@@ -1,5 +1,6 @@
 """Main GUI window for the offline translator"""
 import re
+import socket
 import sys
 import time
 import soundfile as sf
@@ -187,6 +188,75 @@ class RecordingWorker(QThread):
             self.error.emit(f"Recording failed: {str(e)}")
         finally:
             self.work_finished.emit()
+
+
+class ESPButtonListener(QThread):
+    """Listen for hardware button events from the ESP bridge."""
+
+    button_event = pyqtSignal(str)
+    connection_changed = pyqtSignal(bool)
+
+    def __init__(self, host: str, port: int):
+        super().__init__()
+        self.host = host
+        self.port = port
+        self._running = True
+        self._sock = None
+
+    def stop(self):
+        """Stop the listener and close any active socket."""
+        self._running = False
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def run(self):
+        """Reconnect as needed and emit line-based button events."""
+        while self._running:
+            sock = None
+            try:
+                sock = socket.create_connection((self.host, self.port), timeout=5)
+                sock.settimeout(0.5)
+                self._sock = sock
+                self.connection_changed.emit(True)
+                logger.info("ESP button listener connected to %s:%s", self.host, self.port)
+                pending = bytearray()
+                while self._running:
+                    try:
+                        chunk = sock.recv(256)
+                    except socket.timeout:
+                        continue
+                    if not chunk:
+                        break
+                    pending.extend(chunk)
+                    while b"\n" in pending:
+                        raw_line, _, remainder = pending.partition(b"\n")
+                        pending = bytearray(remainder)
+                        event = raw_line.decode("utf-8", errors="ignore").strip().upper()
+                        if event:
+                            self.button_event.emit(event)
+            except OSError as exc:
+                if self._running:
+                    logger.debug("ESP button listener reconnecting: %s", exc)
+            finally:
+                self._sock = None
+                self.connection_changed.emit(False)
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+
+            if self._running:
+                time.sleep(1.0)
 
 
 class ConversationRecordingWorker(QThread):
@@ -1271,6 +1341,8 @@ class MainWindow(QMainWindow):
     """Main application window"""
 
     connectivity_changed_signal = pyqtSignal(bool)
+    esp_button_event_signal = pyqtSignal(str)
+    esp_connection_signal = pyqtSignal(bool)
 
     def __init__(self):
         super().__init__()
@@ -1326,6 +1398,8 @@ class MainWindow(QMainWindow):
         self.translation_warming_pair = None
         self.stt_benchmark_worker = None
         self.worker_thread = None
+        self.esp_button_listener = None
+        self.esp_bridge_connected = False
         self.last_live_log_text = ""
         self.pending_stt_benchmark = None
         self.conversation_session_active = False
@@ -1333,6 +1407,7 @@ class MainWindow(QMainWindow):
         # UI Setup
         self._init_ui()
         self._connect_signals()
+        self._restart_esp_button_listener()
 
         # Start connectivity monitoring
         self.connectivity_service.start_monitoring(interval=self.connectivity_interval)
@@ -1361,6 +1436,11 @@ class MainWindow(QMainWindow):
         self.connectivity_label.setStyleSheet("color: green; font-weight: bold;")
         header_layout.addWidget(QLabel("Connectivity:"))
         header_layout.addWidget(self.connectivity_label)
+
+        self.esp_status_label = QLabel()
+        self.esp_status_label.setStyleSheet("color: #666; font-weight: bold;")
+        header_layout.addWidget(QLabel("ESP:"))
+        header_layout.addWidget(self.esp_status_label)
 
         # Language pair
         self.language_label = QLabel()
@@ -1482,6 +1562,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Ready")
         self._update_language_display()
         self._update_connectivity_display()
+        self._update_esp_status_display()
         self._update_conversation_labels()
 
     def _connect_signals(self):
@@ -1498,9 +1579,54 @@ class MainWindow(QMainWindow):
         # Connectivity callback
         self.connectivity_changed_signal.connect(self._on_connectivity_changed)
         self.connectivity_service.add_callback(self.connectivity_changed_signal.emit)
+        self.esp_button_event_signal.connect(self._on_esp_button_event)
+        self.esp_connection_signal.connect(self._on_esp_connection_changed)
 
         # Log signal
         logger.info("All signals connected")
+
+    def _restart_esp_button_listener(self):
+        """Restart the ESP hardware button listener with current settings."""
+        self._stop_esp_button_listener()
+        if not self.audio_handler.esp_enabled or self.audio_handler.esp_transport != "wifi":
+            return
+
+        button_port = int(self.config.get("esp.button_port", 12347))
+        if not self.audio_handler.esp_host or button_port <= 0:
+            return
+
+        self.esp_button_listener = ESPButtonListener(self.audio_handler.esp_host, button_port)
+        self.esp_button_listener.button_event.connect(self.esp_button_event_signal.emit)
+        self.esp_button_listener.connection_changed.connect(self.esp_connection_signal.emit)
+        self.esp_button_listener.start()
+        logger.info(
+            "ESP button listener starting for tcp://%s:%s",
+            self.audio_handler.esp_host,
+            button_port,
+        )
+
+    def _stop_esp_button_listener(self):
+        """Stop the ESP hardware button listener thread if it exists."""
+        if self.esp_button_listener is None:
+            self.esp_bridge_connected = False
+            self._update_esp_status_display()
+            return
+        self.esp_button_listener.stop()
+        self.esp_button_listener.wait(2000)
+        self.esp_button_listener = None
+        self.esp_bridge_connected = False
+        self._update_esp_status_display()
+
+    def _on_esp_button_event(self, event: str):
+        """Map a hardware button press onto the GUI's toggle button."""
+        if event != "PRESS":
+            return
+        self.ptt_button.click()
+
+    def _on_esp_connection_changed(self, connected: bool):
+        """Update GUI status when the ESP button socket connects or drops."""
+        self.esp_bridge_connected = connected
+        self._update_esp_status_display()
 
     def _on_ptt_clicked(self, checked: bool):
         """Toggle recording on/off with a single button."""
@@ -2156,6 +2282,7 @@ class MainWindow(QMainWindow):
                 "playback_port": settings["esp_play_port"],
             }
         )
+        self._restart_esp_button_listener()
 
         desired_compute_type = self._get_stt_compute_type_for_device(self.stt_device)
         if self.stt_service is not None:
@@ -2230,6 +2357,27 @@ class MainWindow(QMainWindow):
         else:
             self.connectivity_label.setText("🔴 Offline")
             self.connectivity_label.setStyleSheet("color: red; font-weight: bold;")
+
+    def _update_esp_status_display(self):
+        """Update the dedicated ESP bridge status indicator."""
+        if not self.audio_handler.esp_requested_enabled:
+            self.esp_status_label.setText("Disabled")
+            self.esp_status_label.setStyleSheet("color: #666; font-weight: bold;")
+            return
+        if not self.audio_handler.esp_enabled:
+            self.esp_status_label.setText("Misconfigured")
+            self.esp_status_label.setStyleSheet("color: #d9822b; font-weight: bold;")
+            return
+        if self.audio_handler.esp_transport != "wifi":
+            self.esp_status_label.setText(self.audio_handler.esp_transport.upper())
+            self.esp_status_label.setStyleSheet("color: #2b6cb0; font-weight: bold;")
+            return
+        if self.esp_bridge_connected:
+            self.esp_status_label.setText("🟢 Connected")
+            self.esp_status_label.setStyleSheet("color: green; font-weight: bold;")
+            return
+        self.esp_status_label.setText("🟠 Connecting...")
+        self.esp_status_label.setStyleSheet("color: #d9822b; font-weight: bold;")
 
     def _get_stt_compute_type_for_device(self, device: str) -> str:
         """Return the preferred compute type for one STT device."""
@@ -2383,6 +2531,7 @@ class MainWindow(QMainWindow):
             self.recording_thread.wait(5000)
         if self.worker_thread is not None and self.worker_thread.isRunning():
             self.worker_thread.wait(5000)
+        self._stop_esp_button_listener()
         self.connectivity_service.stop_monitoring()
         if self.tts_service is not None:
             self.tts_service.shutdown()

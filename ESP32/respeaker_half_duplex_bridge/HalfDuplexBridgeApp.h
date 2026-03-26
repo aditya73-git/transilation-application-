@@ -37,7 +37,14 @@ class HalfDuplexBridgeApp {
     cfg_.pin_data_rx = half_duplex_bridge_config::kI2SDataInPin;
     cfg_.is_master = false;
 
-    Serial.println("ReSpeaker half-duplex bridge starting...");
+    Serial.println("ReSpeaker half-duplex bridge starting... [btn-debug-v2]");
+    pinMode(half_duplex_bridge_config::kButtonPin, INPUT_PULLUP);
+    buttonLastRaw_ = digitalRead(half_duplex_bridge_config::kButtonPin);
+    buttonReportedDown_ = (buttonLastRaw_ == LOW);
+    buttonLastEdgeMs_ = millis();
+    Serial.printf("BUTTON pin=%d initial=%s\n",
+                  half_duplex_bridge_config::kButtonPin,
+                  buttonLastRaw_ == LOW ? "LOW" : "HIGH");
     if (!restartI2S(RX_MODE)) {
       Serial.println("I2S RX begin failed");
       while (true) {
@@ -48,6 +55,7 @@ class HalfDuplexBridgeApp {
     connectWifi();
     micServer_.begin();
     playServer_.begin();
+    buttonServer_.begin();
 
     xTaskCreatePinnedToCore(
         micCaptureTaskEntry,
@@ -69,12 +77,17 @@ class HalfDuplexBridgeApp {
         "Playback tcp://%s:%u\n",
         WiFi.localIP().toString().c_str(),
         half_duplex_bridge_config::kPlaybackPort);
+    Serial.printf(
+        "Button events tcp://%s:%u\n",
+        WiFi.localIP().toString().c_str(),
+        half_duplex_bridge_config::kButtonPort);
     Serial.println("Half-duplex states: LISTEN_RX -> RECORD_RX -> WAIT_TX -> PLAY_TX -> LISTEN_RX");
     Serial.println("Network format: 16kHz stereo int16 LE");
     Serial.println("I2S format: 16kHz stereo int32 LE");
   }
 
   void tick() {
+    serviceButton();
     switch (state_) {
       case HalfDuplexState::ListeningRx:
         serviceListening();
@@ -98,8 +111,10 @@ class HalfDuplexBridgeApp {
 
   WiFiServer micServer_{half_duplex_bridge_config::kMicPort};
   WiFiServer playServer_{half_duplex_bridge_config::kPlaybackPort};
+  WiFiServer buttonServer_{half_duplex_bridge_config::kButtonPort};
   WiFiClient micClient_;
   WiFiClient playClient_;
+  WiFiClient buttonClient_;
 
   HalfDuplexState state_ = HalfDuplexState::ListeningRx;
   int i2sMode_ = RX_MODE;
@@ -129,6 +144,7 @@ class HalfDuplexBridgeApp {
   unsigned long lastMicMeterMs_ = 0;
   unsigned long playLastByteMs_ = 0;
   unsigned long playLastLogMs_ = 0;
+  unsigned long buttonLastEdgeMs_ = 0;
 
   uint32_t micSessionCount_ = 0;
   uint32_t playSessionCount_ = 0;
@@ -137,6 +153,8 @@ class HalfDuplexBridgeApp {
   uint32_t micPeak_ = 0;
   uint64_t micAbsSum_ = 0;
   uint32_t micFrames_ = 0;
+  int buttonLastRaw_ = HIGH;
+  bool buttonReportedDown_ = false;
 
   void connectWifi() {
     WiFi.setSleep(false);
@@ -299,6 +317,43 @@ class HalfDuplexBridgeApp {
     delay(5);
   }
 
+  void serviceButton() {
+    if (!buttonClient_ || !buttonClient_.connected()) {
+      if (buttonClient_) {
+        buttonClient_.stop();
+      }
+      WiFiClient nextButton = buttonServer_.available();
+      if (nextButton) {
+        buttonClient_ = nextButton;
+        Serial.println("BUTTON client connected");
+      }
+    }
+
+    const int raw = digitalRead(half_duplex_bridge_config::kButtonPin);
+    if (raw != buttonLastRaw_) {
+      Serial.printf("BUTTON raw -> %s\n", raw == LOW ? "LOW" : "HIGH");
+      buttonLastEdgeMs_ = millis();
+      buttonLastRaw_ = raw;
+    }
+
+    if ((millis() - buttonLastEdgeMs_) < half_duplex_bridge_config::kButtonDebounceMs) {
+      return;
+    }
+
+    const bool down = (raw == LOW);
+    if (down && !buttonReportedDown_) {
+      buttonReportedDown_ = true;
+      Serial.println("BUTTON -> PRESS");
+      sendButtonEvent("PRESS\n");
+      return;
+    }
+    if (!down && buttonReportedDown_) {
+      buttonReportedDown_ = false;
+      Serial.println("BUTTON -> RELEASE");
+      sendButtonEvent("RELEASE\n");
+    }
+  }
+
   void serviceRecording() {
     if (!micClient_.connected()) {
       finishRecording("client disconnected");
@@ -446,6 +501,17 @@ class HalfDuplexBridgeApp {
     playbackPrimed_ = false;
     prevMonoSample_ = 0;
     playRingReset();
+  }
+
+  void sendButtonEvent(const char* eventText) {
+    if (!buttonClient_ || !buttonClient_.connected()) {
+      return;
+    }
+    const size_t len = strlen(eventText);
+    if (!writeAll(buttonClient_, reinterpret_cast<const uint8_t*>(eventText), len)) {
+      buttonClient_.stop();
+      Serial.println("BUTTON client disconnected");
+    }
   }
 
   size_t micRingAvailableLocked() const {

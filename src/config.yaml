@@ -129,7 +129,7 @@ audio:
   channels: 1
   chunk_size: 1024
   max_duration: 60
-  silence_threshold: 0.1
+  silence_threshold: 0.07
   silence_duration: 0.5
 esp:
   enabled: true
@@ -137,10 +137,12 @@ esp:
   ble_device_name: ReSpeaker-BLE-Audio
   ble_device_address: ''
   ble_scan_timeout: 8.0
-  host: 192.168.0.103
+  host: 192.168.245.152
   mic_port: 12346
   playback_port: 12345
-  mic_sample_width: 4
+  button_port: 12347
+  mic_sample_width: 2
+  playback_handoff_delay: 0.35
 device:
   device_name: OfflineTranslator
   timezone: UTC
@@ -161,7 +163,7 @@ ui:
   audio_log_enabled: true
   stt_only_mode: false
   live_streaming: false
-  conversation_mode: false
+  conversation_mode: true
   stt_benchmark_cpu_gpu: false
   live_partial_interval: 1.0
   live_partial_step: 2.0

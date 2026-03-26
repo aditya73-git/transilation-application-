@@ -47,7 +47,8 @@ class AudioHandler:
         self.esp_host = (esp_config.get("host") or "").strip()
         self.esp_mic_port = int(esp_config.get("mic_port", 12346))
         self.esp_play_port = int(esp_config.get("playback_port", 12345))
-        self.esp_mic_sample_width = int(esp_config.get("mic_sample_width", 4))
+        self.esp_mic_sample_width = int(esp_config.get("mic_sample_width", 2))
+        self.esp_playback_handoff_delay = float(esp_config.get("playback_handoff_delay", 0.35))
         self.esp_ble_device_name = (esp_config.get("ble_device_name") or "").strip()
         self.esp_ble_device_address = (esp_config.get("ble_device_address") or "").strip()
         self.esp_ble_scan_timeout = float(esp_config.get("ble_scan_timeout", 8.0))
@@ -89,8 +90,8 @@ class AudioHandler:
             self.esp_transport = "wifi"
 
         if self.esp_mic_sample_width not in (2, 4):
-            logger.warning("Unsupported ESP mic sample width %s; defaulting to 4", self.esp_mic_sample_width)
-            self.esp_mic_sample_width = 4
+            logger.warning("Unsupported ESP mic sample width %s; defaulting to 2", self.esp_mic_sample_width)
+            self.esp_mic_sample_width = 2
 
         if self.esp_transport == "ble":
             has_target = bool(self.esp_ble_device_name or self.esp_ble_device_address)
@@ -111,6 +112,9 @@ class AudioHandler:
         self.esp_mic_port = int(esp_config.get("mic_port", self.esp_mic_port))
         self.esp_play_port = int(esp_config.get("playback_port", self.esp_play_port))
         self.esp_mic_sample_width = int(esp_config.get("mic_sample_width", self.esp_mic_sample_width))
+        self.esp_playback_handoff_delay = float(
+            esp_config.get("playback_handoff_delay", self.esp_playback_handoff_delay)
+        )
         self.esp_ble_device_name = str(
             esp_config.get("ble_device_name", self.esp_ble_device_name)
         ).strip()
@@ -866,6 +870,15 @@ class AudioHandler:
             )
 
         from src.utils.esp_audio_transport import stream_wav_to_esp
+
+        if self.esp_transport == "wifi" and self.esp_playback_handoff_delay > 0:
+            logger.info(
+                "ESP playback handoff delay: %.2fs before tcp://%s:%s",
+                self.esp_playback_handoff_delay,
+                self.esp_host,
+                self.esp_play_port,
+            )
+            time.sleep(self.esp_playback_handoff_delay)
 
         return stream_wav_to_esp(self.esp_host, self.esp_play_port, wav_path)
 
