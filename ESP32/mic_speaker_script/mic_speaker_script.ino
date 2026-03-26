@@ -24,8 +24,8 @@
 #include <WiFi.h>
 #include <string.h>
 
-const char* ssid = "Adityahotspot";
-const char* password = "12345678";
+const char* ssid = "Wifi 1";//"Adityahotspot";
+const char* password = "9347575778";//"12345678";
 
 constexpr int kUsrButtonPin = D3;
 constexpr uint32_t kButtonDebounceMs = 40;
@@ -265,15 +265,26 @@ void loop_wifi_dual() {
     }
   }
   if (play_client.connected() && play_client.available()) {
-    int want = play_client.available();
-    if (want > (int)AUDIO_BUFFER_SIZE) {
-      want = AUDIO_BUFFER_SIZE;
-    }
-    int n = play_client.read(audio_buffer, want);
-    if (n > 0) {
-      n -= n % 4;
-      if (n > 0) {
-        size_t out_n = convert_i16_stereo_to_i32_stereo(audio_buffer, static_cast<size_t>(n), play_i2s_buf);
+    int available_bytes = play_client.available();
+    size_t bytes_to_read =
+        available_bytes > (int)AUDIO_BUFFER_SIZE ? AUDIO_BUFFER_SIZE : (size_t)available_bytes;
+    
+    // FIX applied here: Ensure exact multiples of 4 bytes are read for 16-bit stereo
+    bytes_to_read -= bytes_to_read % 4;
+    
+    if (bytes_to_read > 0) {
+      size_t total_read = 0;
+      while (total_read < bytes_to_read && play_client.connected()) {
+        int n = play_client.read(audio_buffer + total_read, bytes_to_read - total_read);
+        if (n > 0) {
+          total_read += n;
+        } else {
+          delay(1);
+        }
+      }
+      
+      if (total_read > 0) {
+        size_t out_n = convert_i16_stereo_to_i32_stereo(audio_buffer, total_read, play_i2s_buf);
         if (out_n > 0 && switch_dual_i2s_mode(TX_MODE)) {
           i2s_dual.write(play_i2s_buf, out_n);
         }
@@ -294,98 +305,81 @@ I2SStream i2s_mic;
 I2SConfig cfg_mic;
 
 constexpr size_t kMicChunkBytes = 4096;
-constexpr size_t kMicRingBytes = 131072;  // ~1s of 16kHz stereo int32 audio
+constexpr uint32_t kPlaybackIdleTimeoutMs = 250;
+constexpr uint32_t kMicIdleRestartMs = 750;
 uint8_t mic_capture_buf[kMicChunkBytes];
-uint8_t mic_send_buf[kMicChunkBytes];
-uint8_t mic_ring_buf[kMicRingBytes];
 
 WiFiServer mic_server(MIC_STREAM_PORT);
 WiFiClient stream_client;
+WiFiServer play_server(AUDIO_PORT);
+WiFiClient play_client;
 PcmMeterState mic_meter;
-TaskHandle_t mic_capture_task_handle = nullptr;
-portMUX_TYPE mic_ring_mux = portMUX_INITIALIZER_UNLOCKED;
-volatile size_t mic_ring_head = 0;
-volatile size_t mic_ring_tail = 0;
-volatile uint32_t mic_ring_overflow_count = 0;
+int current_mic_mode = TX_MODE;
+uint8_t play_i2s_buf[AUDIO_BUFFER_SIZE * 2];
+unsigned long playback_last_activity_ms = 0;
+unsigned long mic_session_started_ms = 0;
+unsigned long mic_last_data_ms = 0;
+unsigned long mic_last_stall_log_ms = 0;
+uint32_t mic_session_bytes = 0;
+unsigned long play_session_started_ms = 0;
+unsigned long play_last_stall_log_ms = 0;
+uint32_t play_session_bytes = 0;
 
-static size_t mic_ring_available_locked() {
-  if (mic_ring_head >= mic_ring_tail) {
-    return mic_ring_head - mic_ring_tail;
-  }
-  return kMicRingBytes - (mic_ring_tail - mic_ring_head);
+static void log_mode_change(const char* label) {
+  Serial.printf("I2S mode -> %s\n", label);
 }
 
-static size_t mic_ring_free_locked() {
-  return (kMicRingBytes - 1) - mic_ring_available_locked();
+static size_t convert_i16_stereo_to_i32_stereo(const uint8_t* src, size_t len, uint8_t* dst) {
+  size_t usable = len - (len % 4);
+  size_t out = 0;
+  for (size_t i = 0; i < usable; i += 4) {
+    int16_t left16 = 0;
+    int16_t right16 = 0;
+    memcpy(&left16, src + i, 2);
+    memcpy(&right16, src + i + 2, 2);
+    int32_t left32 = static_cast<int32_t>(left16) << 16;
+    int32_t right32 = static_cast<int32_t>(right16) << 16;
+    memcpy(dst + out, &left32, 4);
+    memcpy(dst + out + 4, &right32, 4);
+    out += 8;
+  }
+  return out;
 }
 
-static void mic_ring_write(const uint8_t* data, size_t len) {
-  len -= len % 8;
-  if (len == 0) {
-    return;
+static bool switch_mic_i2s_mode(int mode) {
+  if (current_mic_mode == mode) {
+    return true;
   }
-
-  portENTER_CRITICAL(&mic_ring_mux);
-  size_t free_space = mic_ring_free_locked();
-  if (len > free_space) {
-    size_t drop = len - free_space;
-    drop += (8 - (drop % 8)) % 8;
-    mic_ring_tail = (mic_ring_tail + drop) % kMicRingBytes;
-    mic_ring_overflow_count++;
+  i2s_mic.end();
+  delay(10);
+  cfg_mic.rx_tx_mode = static_cast<decltype(cfg_mic.rx_tx_mode)>(mode);
+  if (!i2s_mic.begin(cfg_mic)) {
+    Serial.println(mode == RX_MODE ? "I2S RX begin failed" : "I2S TX begin failed");
+    return false;
   }
-
-  size_t first = min(len, kMicRingBytes - mic_ring_head);
-  memcpy(mic_ring_buf + mic_ring_head, data, first);
-  if (len > first) {
-    memcpy(mic_ring_buf, data + first, len - first);
-  }
-  mic_ring_head = (mic_ring_head + len) % kMicRingBytes;
-  portEXIT_CRITICAL(&mic_ring_mux);
+  current_mic_mode = mode;
+  log_mode_change(mode == RX_MODE ? "RX" : "TX");
+  return true;
 }
 
-static size_t mic_ring_read(uint8_t* out, size_t max_len) {
-  max_len -= max_len % 8;
-  if (max_len == 0) {
-    return 0;
+static bool restart_mic_i2s_mode(int mode, unsigned long settle_ms = 20) {
+  i2s_mic.end();
+  delay(10);
+  cfg_mic.rx_tx_mode = static_cast<decltype(cfg_mic.rx_tx_mode)>(mode);
+  if (!i2s_mic.begin(cfg_mic)) {
+    Serial.println(mode == RX_MODE ? "I2S RX begin failed" : "I2S TX begin failed");
+    return false;
   }
-
-  portENTER_CRITICAL(&mic_ring_mux);
-  size_t available = mic_ring_available_locked();
-  size_t take = min(max_len, available);
-  take -= take % 8;
-  if (take == 0) {
-    portEXIT_CRITICAL(&mic_ring_mux);
-    return 0;
-  }
-
-  size_t first = min(take, kMicRingBytes - mic_ring_tail);
-  memcpy(out, mic_ring_buf + mic_ring_tail, first);
-  if (take > first) {
-    memcpy(out + first, mic_ring_buf, take - first);
-  }
-  mic_ring_tail = (mic_ring_tail + take) % kMicRingBytes;
-  portEXIT_CRITICAL(&mic_ring_mux);
-  return take;
-}
-
-void mic_capture_task(void* arg) {
-  (void)arg;
-  for (;;) {
-    size_t n = i2s_mic.readBytes(mic_capture_buf, kMicChunkBytes);
-    if (n > 0) {
-      update_pcm32_meter_top16(mic_meter, mic_capture_buf, n);
-      maybe_report_meter(mic_meter, "ESP TX");
-      mic_ring_write(mic_capture_buf, n);
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(1));
-    }
-  }
+  current_mic_mode = mode;
+  log_mode_change(mode == RX_MODE ? "RX (reinit)" : "TX (reinit)");
+  delay(settle_ms);
+  return true;
 }
 
 void setup_mic_wifi_stream() {
   Serial.println("Mode: MIC_STREAM_WIFI");
-  AudioLogger::instance().begin(Serial, AudioLogger::Info);
-  cfg_mic = i2s_mic.defaultConfig(RX_MODE);
+  AudioLogger::instance().begin(Serial, AudioLogger::Warning);
+  cfg_mic = i2s_mic.defaultConfig(TX_MODE);
   cfg_mic.copyFrom(info_mic);
   cfg_mic.pin_bck = 8;
   cfg_mic.pin_ws = 7;
@@ -393,7 +387,7 @@ void setup_mic_wifi_stream() {
   cfg_mic.pin_data_rx = 44;
   cfg_mic.is_master = false;
   if (!i2s_mic.begin(cfg_mic)) {
-    Serial.println("I2S RX (mic) begin failed — check MIC_LOOPBACK_USE_TOGGLE / pins");
+    Serial.println("I2S TX begin failed");
     while (1) {
       delay(1000);
     }
@@ -412,20 +406,17 @@ void setup_mic_wifi_stream() {
   Serial.println(WiFi.localIP());
 
   mic_server.begin();
+  play_server.begin();
+  current_mic_mode = TX_MODE;
   Serial.print("Mic stream (raw PCM) tcp://");
   Serial.print(WiFi.localIP());
   Serial.print(":");
   Serial.println(MIC_STREAM_PORT);
-  Serial.println("Format: 16 kHz, stereo, 32-bit LE — use tools/receive_mic_stream.py on laptop");
-
-  xTaskCreatePinnedToCore(
-      mic_capture_task,
-      "mic_capture_task",
-      8192,
-      nullptr,
-      1,
-      &mic_capture_task_handle,
-      1);
+  Serial.print("Playback (send PCM here) tcp://");
+  Serial.print(WiFi.localIP());
+  Serial.print(":");
+  Serial.println(AUDIO_PORT);
+  Serial.println("Idle in speaker-ready TX mode; mic starts only when laptop connects");
 }
 
 static bool write_all_mic(WiFiClient& c, const uint8_t* data, size_t len) {
@@ -443,25 +434,129 @@ static bool write_all_mic(WiFiClient& c, const uint8_t* data, size_t len) {
 void loop_mic_wifi_stream() {
   poll_usr_button();
 
+  if (!play_client.connected()) {
+    play_client.stop();
+    WiFiClient next_play_client = play_server.available();
+    if (next_play_client) {
+      play_client = next_play_client;
+      if (stream_client.connected()) {
+        stream_client.stop();
+        Serial.println("MIC: client closed for playback handoff");
+      }
+      if (restart_mic_i2s_mode(TX_MODE)) {
+        playback_last_activity_ms = millis();
+        play_session_started_ms = millis();
+        play_last_stall_log_ms = play_session_started_ms;
+        play_session_bytes = 0;
+        Serial.println("PLAY: client connected");
+      } else {
+        play_client.stop();
+        restart_mic_i2s_mode(TX_MODE);
+      }
+    }
+  }
+
+  if (play_client.connected()) {
+    if (!switch_mic_i2s_mode(TX_MODE)) {
+      delay(1);
+      return;
+    }
+
+    int available_bytes = play_client.available();
+    if (available_bytes <= 0) {
+      if (!play_client.connected() ||
+          (millis() - playback_last_activity_ms) > kPlaybackIdleTimeoutMs) {
+        play_client.stop();
+        Serial.printf(
+            "PLAY: client disconnected, bytes=%lu, wall=%lums\n",
+            static_cast<unsigned long>(play_session_bytes),
+            millis() - play_session_started_ms);
+        restart_mic_i2s_mode(TX_MODE);
+      } else if ((millis() - play_last_stall_log_ms) > 1000) {
+        Serial.printf(
+            "PLAY: waiting for audio, idle=%lums\n", millis() - playback_last_activity_ms);
+        play_last_stall_log_ms = millis();
+      }
+      delay(1);
+      return;
+    }
+
+    size_t bytes_to_read =
+        available_bytes > (int)AUDIO_BUFFER_SIZE ? AUDIO_BUFFER_SIZE : (size_t)available_bytes;
+    bytes_to_read -= bytes_to_read % 4;
+    if (bytes_to_read == 0) {
+      delay(1);
+      return;
+    }
+
+    int bytes_read = play_client.read(audio_buffer, bytes_to_read);
+    if (bytes_read > 0) {
+      playback_last_activity_ms = millis();
+      play_session_bytes += static_cast<uint32_t>(bytes_read);
+      size_t out_n = convert_i16_stereo_to_i32_stereo(
+          audio_buffer, static_cast<size_t>(bytes_read), play_i2s_buf);
+      if (out_n > 0) {
+        i2s_mic.write(play_i2s_buf, out_n);
+      }
+    }
+    return;
+  }
+
   if (!stream_client.connected()) {
     stream_client.stop();
+    if (current_mic_mode != TX_MODE) {
+      restart_mic_i2s_mode(TX_MODE, 5);
+    }
     WiFiClient next_client = mic_server.available();
     if (next_client) {
       stream_client = next_client;
-      Serial.println("Laptop connected — streaming mic");
+      if (restart_mic_i2s_mode(RX_MODE, 40)) {
+        mic_session_started_ms = millis();
+        mic_last_data_ms = mic_session_started_ms;
+        mic_last_stall_log_ms = mic_session_started_ms;
+        mic_session_bytes = 0;
+        Serial.println("MIC: client connected");
+      } else {
+        stream_client.stop();
+      }
     } else {
       delay(10);
       return;
     }
   }
 
-  size_t n = mic_ring_read(mic_send_buf, kMicChunkBytes);
+  if (!switch_mic_i2s_mode(RX_MODE)) {
+    delay(1);
+    return;
+  }
+
+  size_t n = i2s_mic.readBytes(mic_capture_buf, kMicChunkBytes);
   if (n > 0) {
-    if (!write_all_mic(stream_client, mic_send_buf, n)) {
+    mic_last_data_ms = millis();
+    mic_session_bytes += static_cast<uint32_t>(n);
+    update_pcm32_meter_top16(mic_meter, mic_capture_buf, n);
+    maybe_report_meter(mic_meter, "ESP TX");
+    if (!write_all_mic(stream_client, mic_capture_buf, n)) {
+      const unsigned long now = millis();
+      Serial.printf(
+          "MIC: client disconnected, bytes=%lu, wall=%lums, idle=%lums\n",
+          static_cast<unsigned long>(mic_session_bytes),
+          now - mic_session_started_ms,
+          now - mic_last_data_ms);
       report_send_failure(
           stream_client, "Mic client disconnected", "Mic send failed (socket write error)");
+      switch_mic_i2s_mode(TX_MODE);
     }
   } else {
+    if ((millis() - mic_last_stall_log_ms) > 1000) {
+      Serial.printf("MIC: no I2S data for %lums\n", millis() - mic_last_data_ms);
+      mic_last_stall_log_ms = millis();
+    }
+    if ((millis() - mic_last_data_ms) > kMicIdleRestartMs) {
+      Serial.println("MIC: RX stalled, reinitializing");
+      restart_mic_i2s_mode(RX_MODE, 40);
+      mic_last_data_ms = millis();
+    }
     delay(1);
   }
 }
@@ -671,18 +766,29 @@ void loop() {
 
   size_t bytes_to_read =
       available_bytes > (int)AUDIO_BUFFER_SIZE ? AUDIO_BUFFER_SIZE : (size_t)available_bytes;
+  
+  // FIX applied here for the base mode: Multiples of 8 bytes for 32-bit stereo
   bytes_to_read -= bytes_to_read % 8;
   if (bytes_to_read == 0) {
     delay(1);
     return;
   }
 
-  int bytes_read = client.read(audio_buffer, bytes_to_read);
-  if (bytes_read <= 0) {
+  size_t total_read = 0;
+  while (total_read < bytes_to_read && client.connected()) {
+    int bytes_read = client.read(audio_buffer + total_read, bytes_to_read - total_read);
+    if (bytes_read > 0) {
+      total_read += bytes_read;
+    } else {
+      delay(1);
+    }
+  }
+
+  if (total_read <= 0) {
     return;
   }
 
-  const size_t frames = (size_t)bytes_read / 8;
+  const size_t frames = total_read / 8;
   int16_t pcm_stereo[128 * 2];
   size_t offset = 0;
   while (offset < frames) {

@@ -159,14 +159,18 @@ class Config:
         return self.config.get("audio", {})
 
     def get_esp_config(self):
-        """ReSpeaker / ESP32 WiFi audio bridge (see mic_speaker_script.ino WIFI_DUAL_AUDIO)."""
+        """ReSpeaker / ESP32 external audio bridge configuration."""
         esp = self.config.get("esp", {}) or {}
         return {
             "enabled": bool(esp.get("enabled", False)),
+            "transport": str(esp.get("transport", "wifi")).strip().lower(),
             "host": str(esp.get("host", "10.42.0.27")).strip(),
             "mic_port": int(esp.get("mic_port", 12346)),
             "playback_port": int(esp.get("playback_port", 12345)),
             "mic_sample_width": int(esp.get("mic_sample_width", 4)),
+            "ble_device_name": str(esp.get("ble_device_name", "ReSpeaker-BLE-Audio")).strip(),
+            "ble_device_address": str(esp.get("ble_device_address", "")).strip(),
+            "ble_scan_timeout": float(esp.get("ble_scan_timeout", 8.0)),
         }
 
     def get_cloud_config(self):

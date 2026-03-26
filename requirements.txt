@@ -17,3 +17,4 @@ requests>=2.31.0
 PyYAML>=6.0
 Pillow>=9.0.0
 tqdm>=4.65.0
+bleak>=0.22.0

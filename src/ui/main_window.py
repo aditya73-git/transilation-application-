@@ -3,6 +3,7 @@ import re
 import sys
 import time
 import soundfile as sf
+import numpy as np
 from PyQt5.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -147,6 +148,8 @@ def _finalize_incremental_transcript(pending_text: str, final_tail_text: str) ->
 
 def _save_stt_debug_audio(audio_data, sample_rate: int, label: str) -> str | None:
     """Persist the exact audio clip being sent to STT for listening/debugging."""
+    if not get_config().get("ui.audio_log_enabled", True):
+        return None
     try:
         debug_dir = Path("logs") / "audio_debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -182,6 +185,149 @@ class RecordingWorker(QThread):
         except Exception as e:
             logger.error(f"Recording error: {e}")
             self.error.emit(f"Recording failed: {str(e)}")
+        finally:
+            self.work_finished.emit()
+
+
+class ConversationRecordingWorker(QThread):
+    """Record one conversation turn and stop automatically after trailing silence."""
+
+    work_finished = pyqtSignal()
+    error = pyqtSignal(str)
+    audio_ready = pyqtSignal(object)
+    progress = pyqtSignal(str)
+    partial_ready = pyqtSignal(str)
+
+    def __init__(
+        self,
+        audio_handler,
+        stt_service,
+        source_lang: str,
+        source_lang_code: str,
+        max_duration: int,
+        silence_threshold: float,
+        silence_duration: float,
+        partial_interval: float,
+        partial_step_seconds: float,
+        partial_window_seconds: float,
+    ):
+        super().__init__()
+        self.audio_handler = audio_handler
+        self.stt_service = stt_service
+        self.source_lang = source_lang
+        self.source_lang_code = source_lang_code
+        self.max_duration = max_duration
+        self.silence_threshold = silence_threshold
+        self.silence_duration = silence_duration
+        self.stop_requested = False
+        self.min_speech_seconds = 0.4
+        self.poll_interval = 0.1
+        self.partial_interval = partial_interval
+        self.partial_step_seconds = partial_step_seconds
+        self.partial_window_seconds = partial_window_seconds
+        self.speech_detected = False
+        self.silence_samples = 0
+        self.last_snapshot_samples = 0
+        self.last_partial_samples = 0
+        self.last_partial_at = 0.0
+        self.committed_source_text = ""
+        self.pending_source_text = ""
+        self.last_display_text = ""
+
+    def stop(self):
+        """Stop the current conversation turn capture."""
+        self.stop_requested = True
+        self.audio_handler.stop_recording()
+
+    def run(self):
+        """Capture a single turn until silence is detected."""
+        try:
+            self.progress.emit(
+                f"Conversation mode: listening for {self.source_lang}. Pause to end your turn."
+            )
+            self.audio_handler.start_stream_recording()
+            start_time = time.time()
+            silence_limit = int(self.audio_handler.sample_rate * self.silence_duration)
+            min_speech_samples = int(self.audio_handler.sample_rate * self.min_speech_seconds)
+
+            while not self.stop_requested:
+                if time.time() - start_time >= self.max_duration:
+                    self.progress.emit("Conversation turn reached max duration")
+                    break
+
+                time.sleep(self.poll_interval)
+                snapshot = self.audio_handler.get_recording_snapshot()
+                if snapshot is None:
+                    continue
+                if len(snapshot) <= self.last_snapshot_samples:
+                    continue
+
+                new_chunk = snapshot[self.last_snapshot_samples:]
+                self.last_snapshot_samples = len(snapshot)
+                if new_chunk.size == 0:
+                    continue
+
+                amplitude = float(np.max(np.abs(new_chunk)))
+                if amplitude >= self.silence_threshold:
+                    if not self.speech_detected:
+                        self.progress.emit("Speech detected")
+                    self.speech_detected = True
+                    self.silence_samples = 0
+                    continue
+
+                if self.speech_detected:
+                    self.silence_samples += len(new_chunk)
+                    if len(snapshot) >= min_speech_samples and self.silence_samples >= silence_limit:
+                        self.progress.emit("Conversation turn ended by silence")
+                        break
+
+                if (
+                    self.speech_detected
+                    and self.stt_service is not None
+                    and len(snapshot) - self.last_partial_samples
+                    >= int(self.partial_step_seconds * self.audio_handler.sample_rate)
+                    and (time.time() - self.last_partial_at) >= self.partial_interval
+                ):
+                    window_samples = int(self.partial_window_seconds * self.audio_handler.sample_rate)
+                    live_window = snapshot[-window_samples:] if len(snapshot) > window_samples else snapshot
+                    text, _, _ = self.stt_service.transcribe(
+                        live_window,
+                        language=self.source_lang_code,
+                    )
+                    self.last_partial_samples = len(snapshot)
+                    self.last_partial_at = time.time()
+                    if text:
+                        committed_chunk, self.pending_source_text = _advance_incremental_transcript(
+                            self.pending_source_text,
+                            text,
+                        )
+                        if committed_chunk:
+                            self.committed_source_text = _append_text(
+                                self.committed_source_text,
+                                committed_chunk,
+                            )
+
+                        display_text = _append_text(
+                            self.committed_source_text,
+                            self.pending_source_text,
+                        )
+                        if display_text and display_text != self.last_display_text:
+                            self.last_display_text = display_text
+                            self.partial_ready.emit(display_text)
+
+            audio_data = self.audio_handler.stop_stream_recording()
+            if self.stop_requested:
+                return
+            if audio_data is None or len(audio_data) == 0:
+                self.error.emit("Failed to capture audio. Try again.")
+                return
+            if not self.speech_detected:
+                self.error.emit("No speech detected. Try again.")
+                return
+            self.audio_ready.emit(audio_data)
+        except Exception as e:
+            logger.error(f"Conversation recording error: {e}")
+            self.error.emit(f"Conversation recording failed: {str(e)}")
         finally:
             self.work_finished.emit()
 
@@ -487,6 +633,7 @@ class StreamingPipelineWorker(QThread):
         partial_step_seconds: float,
         partial_window_seconds: float,
         auto_play_output: bool,
+        conversation_mode: bool = False,
     ):
         super().__init__()
         self.audio_handler = audio_handler
@@ -504,6 +651,7 @@ class StreamingPipelineWorker(QThread):
         self.partial_step_seconds = partial_step_seconds
         self.partial_window_seconds = partial_window_seconds
         self.auto_play_output = auto_play_output
+        self.conversation_mode = conversation_mode
         self.last_processed_samples = 0
         self.last_source_text = ""
         self.last_translated_text = ""
@@ -567,6 +715,9 @@ class StreamingPipelineWorker(QThread):
             self.progress.emit(f"Listening for {source_lang}...")
             self.audio_handler.start_stream_recording()
 
+            self.speech_detected = False
+            self.silence_samples = 0
+
             while not self.stop_requested:
                 if time.time() - start_time >= self.max_duration:
                     self.progress.emit("Max recording duration reached")
@@ -584,7 +735,20 @@ class StreamingPipelineWorker(QThread):
                 window_samples = int(self.partial_window_seconds * self.audio_handler.sample_rate)
                 live_window = snapshot[-window_samples:] if len(snapshot) > window_samples else snapshot
                 stt_start = take_perf_sample()
-                text, _, _ = self.stt_service.transcribe(live_window, language=source_lang_code)
+
+                if self.conversation_mode:
+                    amplitude = float(np.max(np.abs(live_window))) if live_window.size else 0.0
+                    if amplitude > 0.02:
+                        self.speech_detected = True
+                        self.silence_samples = 0
+                    elif getattr(self, "speech_detected", False):
+                        self.silence_samples += (len(snapshot) - self.last_processed_samples)
+                        if self.silence_samples > int(1.5 * self.audio_handler.sample_rate):
+                            self.progress.emit("End of turn detected (silence)")
+                            break
+
+                transcribe_lang = None if self.conversation_mode else source_lang_code
+                text, _, _ = self.stt_service.transcribe(live_window, language=transcribe_lang)
                 stt_end = take_perf_sample()
                 stt_metrics = stage_metrics(stt_start, stt_end)
                 self.partial_stt_runs += 1
@@ -630,7 +794,8 @@ class StreamingPipelineWorker(QThread):
             if debug_audio_path:
                 self.progress.emit(f"Saved STT input audio: {debug_audio_path}")
             final_stt_start = take_perf_sample()
-            final_text, _, _ = self.stt_service.transcribe(final_audio, language=source_lang_code)
+            transcribe_lang = None if self.conversation_mode else source_lang_code
+            final_text, final_detected_lang, _ = self.stt_service.transcribe(final_audio, language=transcribe_lang)
             if not final_text:
                 tail_samples = int(
                     max(
@@ -649,10 +814,12 @@ class StreamingPipelineWorker(QThread):
                 )
                 if tail_audio_path:
                     self.progress.emit(f"Saved STT tail fallback audio: {tail_audio_path}")
-                final_tail_text, _, _ = self.stt_service.transcribe(
+                final_tail_text, tail_detected_lang, _ = self.stt_service.transcribe(
                     final_tail_audio,
-                    language=source_lang_code,
+                    language=transcribe_lang,
                 )
+                if not final_text:
+                    final_detected_lang = tail_detected_lang
                 final_text = _append_text(
                     self.committed_source_text,
                     _finalize_incremental_transcript(self.pending_source_text, final_tail_text),
@@ -661,6 +828,11 @@ class StreamingPipelineWorker(QThread):
             if not final_text:
                 self.error.emit("Failed to recognize speech. Try again.")
                 return
+
+            if self.conversation_mode:
+                target_code = self.language_service.get_language_code(target_lang)
+                if final_detected_lang == target_code:
+                    source_lang, target_lang = target_lang, source_lang
 
             final_translation_start = take_perf_sample()
             final_translated = self._translate_for_display(
@@ -927,7 +1099,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setModal(True)
-        self.resize(460, 380)
+        self.resize(520, 460)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -955,6 +1127,10 @@ class SettingsDialog(QDialog):
         self.auto_play_checkbox.setChecked(settings["auto_play_output"])
         form.addRow("Auto-play", self.auto_play_checkbox)
 
+        self.audio_log_checkbox = QCheckBox("Save input audio clips for debugging")
+        self.audio_log_checkbox.setChecked(settings["audio_log_enabled"])
+        form.addRow("Audio log", self.audio_log_checkbox)
+
         self.show_logs_checkbox = QCheckBox("Show log panel")
         self.show_logs_checkbox.setChecked(settings["show_logs"])
         form.addRow("Logs", self.show_logs_checkbox)
@@ -964,6 +1140,20 @@ class SettingsDialog(QDialog):
         self.max_duration_spin.setValue(settings["max_duration"])
         self.max_duration_spin.setSuffix(" s")
         form.addRow("Max recording", self.max_duration_spin)
+
+        self.silence_threshold_spin = QDoubleSpinBox()
+        self.silence_threshold_spin.setRange(0.001, 0.200)
+        self.silence_threshold_spin.setSingleStep(0.001)
+        self.silence_threshold_spin.setDecimals(3)
+        self.silence_threshold_spin.setValue(settings["silence_threshold"])
+        form.addRow("Silence threshold", self.silence_threshold_spin)
+
+        self.silence_duration_spin = QDoubleSpinBox()
+        self.silence_duration_spin.setRange(0.2, 5.0)
+        self.silence_duration_spin.setSingleStep(0.1)
+        self.silence_duration_spin.setValue(settings["silence_duration"])
+        self.silence_duration_spin.setSuffix(" s")
+        form.addRow("Silence end delay", self.silence_duration_spin)
 
         self.partial_interval_spin = QDoubleSpinBox()
         self.partial_interval_spin.setRange(0.5, 10.0)
@@ -992,9 +1182,25 @@ class SettingsDialog(QDialog):
         self.connectivity_interval_spin.setSuffix(" s")
         form.addRow("Connectivity check", self.connectivity_interval_spin)
 
-        self.esp_enable_checkbox = QCheckBox("Use ReSpeaker ESP (WiFi mic + speaker)")
+        self.esp_enable_checkbox = QCheckBox("Use ReSpeaker ESP bridge")
         self.esp_enable_checkbox.setChecked(settings.get("esp_enabled", False))
         form.addRow("ESP bridge", self.esp_enable_checkbox)
+        self.esp_transport_combo = QComboBox()
+        self.esp_transport_combo.addItem("Bluetooth LE", "ble")
+        self.esp_transport_combo.addItem("Wi-Fi TCP", "wifi")
+        transport_index = self.esp_transport_combo.findData(settings.get("esp_transport", "ble"))
+        self.esp_transport_combo.setCurrentIndex(transport_index if transport_index >= 0 else 0)
+        form.addRow("ESP transport", self.esp_transport_combo)
+        self.esp_ble_name_edit = QLineEdit(settings.get("esp_ble_device_name", "ReSpeaker-BLE-Audio"))
+        form.addRow("ESP BLE name", self.esp_ble_name_edit)
+        self.esp_ble_address_edit = QLineEdit(settings.get("esp_ble_device_address", ""))
+        form.addRow("ESP BLE address", self.esp_ble_address_edit)
+        self.esp_ble_scan_timeout_spin = QDoubleSpinBox()
+        self.esp_ble_scan_timeout_spin.setRange(2.0, 30.0)
+        self.esp_ble_scan_timeout_spin.setSingleStep(0.5)
+        self.esp_ble_scan_timeout_spin.setValue(float(settings.get("esp_ble_scan_timeout", 8.0)))
+        self.esp_ble_scan_timeout_spin.setSuffix(" s")
+        form.addRow("BLE scan timeout", self.esp_ble_scan_timeout_spin)
         self.esp_host_edit = QLineEdit(settings.get("esp_host", "10.42.0.27"))
         form.addRow("ESP IP / host", self.esp_host_edit)
         self.esp_mic_port_spin = QSpinBox()
@@ -1008,10 +1214,30 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(form)
 
+        self.esp_enable_checkbox.toggled.connect(self._update_esp_fields)
+        self.esp_transport_combo.currentIndexChanged.connect(self._update_esp_fields)
+        self._update_esp_fields()
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _update_esp_fields(self):
+        """Enable only the ESP settings relevant to the selected transport."""
+        esp_enabled = self.esp_enable_checkbox.isChecked()
+        transport = self.esp_transport_combo.currentData()
+
+        ble_enabled = esp_enabled and transport == "ble"
+        wifi_enabled = esp_enabled and transport == "wifi"
+
+        self.esp_transport_combo.setEnabled(esp_enabled)
+        self.esp_ble_name_edit.setEnabled(ble_enabled)
+        self.esp_ble_address_edit.setEnabled(ble_enabled)
+        self.esp_ble_scan_timeout_spin.setEnabled(ble_enabled)
+        self.esp_host_edit.setEnabled(wifi_enabled)
+        self.esp_mic_port_spin.setEnabled(wifi_enabled)
+        self.esp_play_port_spin.setEnabled(wifi_enabled)
 
     def get_values(self) -> dict:
         """Return dialog values."""
@@ -1021,13 +1247,20 @@ class SettingsDialog(QDialog):
             "stt_benchmark_cpu_gpu": self.stt_benchmark_checkbox.isChecked(),
             "live_streaming": self.live_streaming_checkbox.isChecked(),
             "auto_play_output": self.auto_play_checkbox.isChecked(),
+            "audio_log_enabled": self.audio_log_checkbox.isChecked(),
             "show_logs": self.show_logs_checkbox.isChecked(),
             "max_duration": self.max_duration_spin.value(),
+            "silence_threshold": self.silence_threshold_spin.value(),
+            "silence_duration": self.silence_duration_spin.value(),
             "partial_interval": self.partial_interval_spin.value(),
             "partial_step_seconds": self.partial_step_spin.value(),
             "partial_window_seconds": self.partial_window_spin.value(),
             "connectivity_interval": self.connectivity_interval_spin.value(),
             "esp_enabled": self.esp_enable_checkbox.isChecked(),
+            "esp_transport": self.esp_transport_combo.currentData(),
+            "esp_ble_device_name": self.esp_ble_name_edit.text().strip(),
+            "esp_ble_device_address": self.esp_ble_address_edit.text().strip(),
+            "esp_ble_scan_timeout": self.esp_ble_scan_timeout_spin.value(),
             "esp_host": self.esp_host_edit.text().strip(),
             "esp_mic_port": self.esp_mic_port_spin.value(),
             "esp_play_port": self.esp_play_port_spin.value(),
@@ -1072,7 +1305,9 @@ class MainWindow(QMainWindow):
         self.stt_benchmark_cpu_gpu = self.config.get("ui.stt_benchmark_cpu_gpu", False)
         self.stt_only_mode = self.config.get("ui.stt_only_mode", False)
         self.live_streaming_enabled = self.config.get("ui.live_streaming", False)
+        self.conversation_mode_enabled = self.config.get("ui.conversation_mode", False)
         self.auto_play_output = self.config.get("ui.auto_play_output", True)
+        self.audio_log_enabled = self.config.get("ui.audio_log_enabled", True)
         self.show_logs = self.config.get("ui.show_logs", True)
         self.partial_interval = float(self.config.get("ui.live_partial_interval", 1.0))
         self.partial_step_seconds = float(self.config.get("ui.live_partial_step", 2.0))
@@ -1084,6 +1319,7 @@ class MainWindow(QMainWindow):
         self.is_processing = False
         self.is_streaming = False
         self.recording_thread = None
+        self.conversation_recording_worker = None
         self.streaming_stt_worker = None
         self.streaming_pipeline_worker = None
         self.translation_warmup_worker = None
@@ -1092,6 +1328,7 @@ class MainWindow(QMainWindow):
         self.worker_thread = None
         self.last_live_log_text = ""
         self.pending_stt_benchmark = None
+        self.conversation_session_active = False
 
         # UI Setup
         self._init_ui()
@@ -1134,6 +1371,16 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(header_layout)
 
         # ===== Text Display Areas =====
+        self.turn_label = QLabel()
+        self.turn_label.setFont(QFont("Arial", 11, QFont.Bold))
+        self.turn_label.setStyleSheet("color: #1b5e20;")
+        main_layout.addWidget(self.turn_label)
+
+        self.turn_hint_label = QLabel()
+        self.turn_hint_label.setWordWrap(True)
+        self.turn_hint_label.setStyleSheet("color: #555;")
+        main_layout.addWidget(self.turn_hint_label)
+
         # Source text
         main_layout.addWidget(QLabel("SOURCE TEXT:"))
         self.source_text = QTextEdit()
@@ -1199,6 +1446,12 @@ class MainWindow(QMainWindow):
         lang_layout.addWidget(self.source_lang_combo)
         lang_layout.addWidget(QLabel("To"))
         lang_layout.addWidget(self.target_lang_combo)
+        
+        self.conversation_mode_checkbox = QCheckBox("Conversation Mode")
+        self.conversation_mode_checkbox.setStyleSheet("margin-left: 15px; font-weight: bold;")
+        self.conversation_mode_checkbox.setChecked(self.conversation_mode_enabled)
+        lang_layout.addWidget(self.conversation_mode_checkbox)
+
         lang_layout.addStretch()
         lang_layout.addWidget(self.settings_btn)
 
@@ -1229,6 +1482,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Ready")
         self._update_language_display()
         self._update_connectivity_display()
+        self._update_conversation_labels()
 
     def _connect_signals(self):
         """Connect UI signals to slots"""
@@ -1238,6 +1492,7 @@ class MainWindow(QMainWindow):
         # Language selectors
         self.source_lang_combo.currentIndexChanged.connect(self._on_source_language_changed)
         self.target_lang_combo.currentIndexChanged.connect(self._on_target_language_changed)
+        self.conversation_mode_checkbox.toggled.connect(self._on_conversation_mode_toggled)
         self.settings_btn.clicked.connect(self._on_settings)
 
         # Connectivity callback
@@ -1249,10 +1504,104 @@ class MainWindow(QMainWindow):
 
     def _on_ptt_clicked(self, checked: bool):
         """Toggle recording on/off with a single button."""
+        if self.conversation_mode_enabled and not self.live_streaming_enabled:
+            if checked:
+                self._start_conversation_session()
+            else:
+                self._stop_conversation_session()
+            return
         if checked:
             self._on_ptt_pressed(None)
         else:
             self._on_ptt_released(None)
+
+    def _start_conversation_session(self):
+        """Start a continuous turn-based conversation session."""
+        if self.conversation_session_active:
+            self.ptt_button.setChecked(True)
+            return
+        if self.is_processing or self.is_streaming or self.is_recording:
+            self.ptt_button.setChecked(False)
+            return
+        self.conversation_session_active = True
+        self._log("Conversation session started")
+        self._update_conversation_labels()
+        self._begin_conversation_turn()
+
+    def _stop_conversation_session(self):
+        """Stop the current conversation session."""
+        self.conversation_session_active = False
+        self.pending_stt_benchmark = None
+        if self.conversation_recording_worker is not None:
+            self.conversation_recording_worker.stop()
+        elif self.recording_thread is not None and self.recording_thread.isRunning():
+            self.audio_handler.stop_recording()
+        self._log("Conversation session stopped")
+        if not self.is_processing:
+            self._reset_ptt_button()
+            self.ptt_button.setEnabled(True)
+            self.status_label.setText("Ready")
+            self.statusBar().showMessage("Conversation stopped")
+        self._update_conversation_labels()
+
+    def _begin_conversation_turn(self):
+        """Begin listening for the next speaker turn in conversation mode."""
+        if not self.conversation_session_active:
+            return
+        if self.is_processing or self.is_recording or self.is_streaming:
+            return
+        if not self._ensure_pipeline_services():
+            self.conversation_session_active = False
+            self.ptt_button.setChecked(False)
+            return
+
+        source_lang, _ = self.language_service.get_current_pair()
+        self.is_recording = True
+        self.audio_handler.is_recording = True
+        self.source_text.clear()
+        self.translated_text.setText(
+            f"Conversation mode active. Speak in {source_lang.capitalize()} and pause to end your turn."
+        )
+        self.ptt_button.setChecked(True)
+        self.ptt_button.setEnabled(True)
+        self.ptt_button.setText("⏹️  STOP CONVERSATION  🔊")
+        self.ptt_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                font-weight: bold;
+                font-size: 14px;
+            }
+            """
+        )
+        self.status_label.setText(f"Listening: {source_lang.capitalize()}")
+        self.statusBar().showMessage(
+            f"Conversation mode: listening for {source_lang.capitalize()}"
+        )
+        self._update_conversation_labels()
+        self._start_translation_warmup()
+
+        self.conversation_recording_worker = ConversationRecordingWorker(
+            self.audio_handler,
+            self.stt_service,
+            source_lang,
+            self.language_service.get_language_code(source_lang),
+            int(self.audio_config.get("max_duration", 10)),
+            float(self.audio_config.get("silence_threshold", 0.01)),
+            float(self.audio_config.get("silence_duration", 0.5)),
+            self.partial_interval,
+            self.partial_step_seconds,
+            self.partial_window_seconds,
+        )
+        self.conversation_recording_worker.progress.connect(self._on_progress)
+        self.conversation_recording_worker.partial_ready.connect(self._on_partial_stt_ready)
+        self.conversation_recording_worker.audio_ready.connect(self._on_audio_recorded)
+        self.conversation_recording_worker.error.connect(self._on_recording_error)
+        self.conversation_recording_worker.finished.connect(self._on_conversation_recording_finished)
+        self.conversation_recording_worker.start()
 
     def _on_ptt_pressed(self, event):
         """Handle recording start."""
@@ -1335,6 +1684,7 @@ class MainWindow(QMainWindow):
             self.partial_step_seconds,
             self.partial_window_seconds,
             self.auto_play_output,
+            self.conversation_mode_checkbox.isChecked(),
         )
         self.streaming_pipeline_worker.progress.connect(self._on_progress)
         self.streaming_pipeline_worker.partial_update.connect(self._on_partial_pipeline_update)
@@ -1364,8 +1714,25 @@ class MainWindow(QMainWindow):
     def _reset_ptt_button(self):
         """Restore the default toggle button style."""
         self.is_recording = False
-        self.ptt_button.setChecked(False)
-        self.ptt_button.setText("🎙️  START RECORDING  🔊")
+        if self.conversation_session_active and self.conversation_mode_enabled:
+            self.ptt_button.setChecked(True)
+            self.ptt_button.setText("⏹️  STOP CONVERSATION  🔊")
+            self.ptt_button.setStyleSheet(
+                """
+                QPushButton {
+                    background-color: #f44336;
+                    color: white;
+                    border: none;
+                    border-radius: 5px;
+                    font-weight: bold;
+                    font-size: 14px;
+                }
+                """
+            )
+            return
+        else:
+            self.ptt_button.setChecked(False)
+            self.ptt_button.setText("🎙️  START RECORDING  🔊")
         self.ptt_button.setStyleSheet(
             """
             QPushButton {
@@ -1393,13 +1760,24 @@ class MainWindow(QMainWindow):
         """Handle when batch audio capture completes."""
         self.recording_thread = None
 
+    def _on_conversation_recording_finished(self):
+        """Handle when one silence-ended conversation turn capture finishes."""
+        self.conversation_recording_worker = None
+
     def _on_recording_error(self, error: str):
         """Handle recording failures."""
         self.pending_stt_benchmark = None
-        self._reset_ptt_button()
-        self.ptt_button.setEnabled(True)
+        self.is_recording = False
+        if self.conversation_session_active and self.conversation_mode_enabled:
+            self.status_label.setText("Conversation paused")
+            self.translated_text.setText(error)
+            self.ptt_button.setEnabled(True)
+        else:
+            self._reset_ptt_button()
+            self.ptt_button.setEnabled(True)
         self.statusBar().showMessage("Recording failed")
         self._log(f"ERROR: {error}")
+        self._update_conversation_labels()
 
     def _start_translation_warmup(self, force: bool = False):
         """Warm the currently selected translation route in the background."""
@@ -1459,7 +1837,14 @@ class MainWindow(QMainWindow):
 
     def _process_audio(self, audio_data):
         """Process recorded audio through the active pipeline stage."""
-        self._reset_ptt_button()
+        self.is_recording = False
+        if self.conversation_session_active and self.conversation_mode_enabled:
+            self.ptt_button.setChecked(True)
+            self.ptt_button.setText("⏳  PROCESSING TURN...  🔊")
+            self.status_label.setText("Processing turn...")
+            self._update_conversation_labels()
+        else:
+            self._reset_ptt_button()
 
         if audio_data is None or len(audio_data) == 0:
             self.statusBar().showMessage("Recording failed")
@@ -1515,7 +1900,10 @@ class MainWindow(QMainWindow):
     def _on_partial_stt_ready(self, text: str):
         """Show partial STT output while the user is still speaking."""
         self.source_text.setText(text)
-        self.translated_text.setText("Streaming STT active...")
+        if self.conversation_session_active and self.conversation_mode_enabled:
+            self.translated_text.setText("Listening... pause to end the turn and translate.")
+        else:
+            self.translated_text.setText("Streaming STT active...")
 
     def _on_partial_pipeline_update(self, source_text: str, translated_text: str):
         """Show partial STT and translation output while the user is still speaking."""
@@ -1543,6 +1931,8 @@ class MainWindow(QMainWindow):
         self.source_text.setText(source_text)
         self.translated_text.setText(translated_text)
         self._log(f"✓ Complete in {elapsed}")
+        if self.conversation_session_active and self.conversation_mode_enabled and not self.stt_only_mode:
+            self._advance_conversation_turn()
         if self.pending_stt_benchmark and self.stt_benchmark_worker is None:
             self._start_stt_benchmark()
 
@@ -1564,10 +1954,18 @@ class MainWindow(QMainWindow):
     def _on_processing_finished(self):
         """Handle when processing finishes"""
         self.is_processing = False
-        self.ptt_button.setEnabled(True)
         self.progress_bar.setVisible(False)
-        self.status_label.setText("STT Ready" if self.stt_only_mode else "Ready")
         self.worker_thread = None
+        if self.conversation_session_active and self.conversation_mode_enabled and not self.stt_only_mode:
+            self.ptt_button.setEnabled(True)
+            self.status_label.setText(f"Next turn: {self.language_service.display_pair()}")
+            self._update_conversation_labels()
+            QTimer.singleShot(150, self._begin_conversation_turn)
+            return
+
+        self.ptt_button.setEnabled(True)
+        self.status_label.setText("STT Ready" if self.stt_only_mode else "Ready")
+        self._update_conversation_labels()
 
     def _on_streaming_stt_finished(self):
         """Handle when streaming STT stops."""
@@ -1580,10 +1978,14 @@ class MainWindow(QMainWindow):
     def _on_streaming_pipeline_finished(self):
         """Handle when the streaming translation pipeline stops."""
         self.is_streaming = False
+        self.streaming_pipeline_worker = None
         self._reset_ptt_button()
         self.ptt_button.setEnabled(True)
-        self.status_label.setText("Ready")
-        self.streaming_pipeline_worker = None
+        if self.conversation_mode_enabled and not self.stt_only_mode:
+            self.status_label.setText(f"Next turn: {self.language_service.display_pair()}")
+        else:
+            self.status_label.setText("Ready")
+        self._update_conversation_labels()
 
     def _on_source_language_changed(self, index: int):
         """Handle source language dropdown changes."""
@@ -1619,6 +2021,39 @@ class MainWindow(QMainWindow):
         self._log(f"Switched to: {self.language_service.display_pair()}")
         self._start_translation_warmup(force=True)
 
+    def _on_conversation_mode_toggled(self, checked: bool):
+        """Enable or disable conversation mode."""
+        self.conversation_mode_enabled = checked
+        if checked and self.live_streaming_enabled:
+            self.live_streaming_enabled = False
+            self.config.set("ui.live_streaming", False, persist=True)
+            self._log("Conversation mode uses automatic turn detection; live mode was disabled")
+        self.config.set("ui.conversation_mode", checked, persist=True)
+        if checked:
+            self.statusBar().showMessage("Conversation mode enabled")
+            self._log("Conversation mode enabled")
+            if not self.stt_only_mode:
+                self._start_translation_warmup(force=True)
+        else:
+            if self.conversation_session_active:
+                self._stop_conversation_session()
+            self.statusBar().showMessage("Conversation mode disabled")
+            self._log("Conversation mode disabled")
+        self._update_conversation_labels()
+
+    def _advance_conversation_turn(self):
+        """Swap source and target languages for the next speaker turn."""
+        source, target = self.language_service.get_current_pair()
+        if not self.language_service.set_language_pair(target, source):
+            return
+        self._update_language_display()
+        self._start_translation_warmup(force=True)
+        next_pair = self.language_service.display_pair()
+        self.statusBar().showMessage(f"Conversation mode: next turn {next_pair}")
+        self.status_label.setText(f"Next turn: {next_pair}")
+        self._log(f"Conversation mode: next turn {next_pair}")
+        self._update_conversation_labels()
+
     def _on_settings(self):
         """Open settings dialog and apply runtime settings."""
         dialog = SettingsDialog(
@@ -1628,13 +2063,20 @@ class MainWindow(QMainWindow):
                 "stt_benchmark_cpu_gpu": self.stt_benchmark_cpu_gpu,
                 "live_streaming": self.live_streaming_enabled,
                 "auto_play_output": self.auto_play_output,
+                "audio_log_enabled": self.audio_log_enabled,
                 "show_logs": self.show_logs,
                 "max_duration": int(self.audio_config.get("max_duration", 10)),
+                "silence_threshold": float(self.audio_config.get("silence_threshold", 0.01)),
+                "silence_duration": float(self.audio_config.get("silence_duration", 0.5)),
                 "partial_interval": self.partial_interval,
                 "partial_step_seconds": self.partial_step_seconds,
                 "partial_window_seconds": self.partial_window_seconds,
                 "connectivity_interval": self.connectivity_interval,
-                "esp_enabled": self.audio_handler.esp_enabled,
+                "esp_enabled": self.audio_handler.esp_requested_enabled,
+                "esp_transport": self.audio_handler.esp_transport,
+                "esp_ble_device_name": self.audio_handler.esp_ble_device_name,
+                "esp_ble_device_address": self.audio_handler.esp_ble_device_address,
+                "esp_ble_scan_timeout": self.audio_handler.esp_ble_scan_timeout,
                 "esp_host": self.audio_handler.esp_host,
                 "esp_mic_port": self.audio_handler.esp_mic_port,
                 "esp_play_port": self.audio_handler.esp_play_port,
@@ -1658,8 +2100,11 @@ class MainWindow(QMainWindow):
         self.stt_benchmark_cpu_gpu = settings["stt_benchmark_cpu_gpu"]
         self.live_streaming_enabled = settings["live_streaming"]
         self.auto_play_output = settings["auto_play_output"]
+        self.audio_log_enabled = settings["audio_log_enabled"]
         self.show_logs = settings["show_logs"]
         self.audio_config["max_duration"] = settings["max_duration"]
+        self.audio_config["silence_threshold"] = settings["silence_threshold"]
+        self.audio_config["silence_duration"] = settings["silence_duration"]
         self.partial_interval = settings["partial_interval"]
         self.partial_step_seconds = settings["partial_step_seconds"]
         self.partial_window_seconds = settings["partial_window_seconds"]
@@ -1677,13 +2122,21 @@ class MainWindow(QMainWindow):
                 "ui.stt_benchmark_cpu_gpu": self.stt_benchmark_cpu_gpu,
                 "ui.live_streaming": self.live_streaming_enabled,
                 "ui.auto_play_output": self.auto_play_output,
+                "ui.audio_log_enabled": self.audio_log_enabled,
                 "ui.show_logs": self.show_logs,
+                "ui.conversation_mode": self.conversation_mode_enabled,
                 "ui.live_partial_interval": self.partial_interval,
                 "ui.live_partial_step": self.partial_step_seconds,
                 "ui.live_partial_window": self.partial_window_seconds,
                 "ui.connectivity_interval": self.connectivity_interval,
                 "audio.max_duration": settings["max_duration"],
+                "audio.silence_threshold": settings["silence_threshold"],
+                "audio.silence_duration": settings["silence_duration"],
                 "esp.enabled": settings["esp_enabled"],
+                "esp.transport": settings["esp_transport"],
+                "esp.ble_device_name": settings["esp_ble_device_name"],
+                "esp.ble_device_address": settings["esp_ble_device_address"],
+                "esp.ble_scan_timeout": settings["esp_ble_scan_timeout"],
                 "esp.host": settings["esp_host"],
                 "esp.mic_port": settings["esp_mic_port"],
                 "esp.playback_port": settings["esp_play_port"],
@@ -1691,12 +2144,18 @@ class MainWindow(QMainWindow):
             persist=True,
         )
 
-        self.audio_handler.esp_enabled = bool(
-            settings["esp_enabled"] and settings["esp_host"].strip()
+        self.audio_handler.update_esp_config(
+            {
+                "enabled": settings["esp_enabled"],
+                "transport": settings["esp_transport"],
+                "ble_device_name": settings["esp_ble_device_name"],
+                "ble_device_address": settings["esp_ble_device_address"],
+                "ble_scan_timeout": settings["esp_ble_scan_timeout"],
+                "host": settings["esp_host"],
+                "mic_port": settings["esp_mic_port"],
+                "playback_port": settings["esp_play_port"],
+            }
         )
-        self.audio_handler.esp_host = settings["esp_host"].strip()
-        self.audio_handler.esp_mic_port = int(settings["esp_mic_port"])
-        self.audio_handler.esp_play_port = int(settings["esp_play_port"])
 
         desired_compute_type = self._get_stt_compute_type_for_device(self.stt_device)
         if self.stt_service is not None:
@@ -1736,6 +2195,31 @@ class MainWindow(QMainWindow):
             self.target_lang_combo.setCurrentIndex(target_index)
         self.source_lang_combo.blockSignals(False)
         self.target_lang_combo.blockSignals(False)
+        self._update_conversation_labels()
+
+    def _update_conversation_labels(self):
+        """Show clear turn guidance for normal mode and conversation mode."""
+        source, target = self.language_service.get_current_pair()
+        if self.conversation_mode_enabled:
+            self.turn_label.setText(
+                f"Turn: Speaker ({source.capitalize()}) -> Listener ({target.capitalize()})"
+            )
+            if self.conversation_session_active:
+                self.turn_hint_label.setText(
+                    f"Speak in {source.capitalize()}. Pause briefly to end your turn. "
+                    f"After playback, the app will switch to {target.capitalize()} -> {source.capitalize()}."
+                )
+            else:
+                self.turn_hint_label.setText(
+                    f"Conversation mode is on. Click start to begin with {source.capitalize()} speaking."
+                )
+        else:
+            self.turn_label.setText(
+                f"Current direction: {source.capitalize()} -> {target.capitalize()}"
+            )
+            self.turn_hint_label.setText(
+                "Record one turn at a time. Use Conversation Mode for automatic turn swapping."
+            )
 
     def _update_connectivity_display(self):
         """Update connectivity indicator"""
@@ -1892,6 +2376,9 @@ class MainWindow(QMainWindow):
             self.translation_warmup_worker.wait(5000)
         if self.stt_benchmark_worker is not None and self.stt_benchmark_worker.isRunning():
             self.stt_benchmark_worker.wait(5000)
+        if self.conversation_recording_worker is not None and self.conversation_recording_worker.isRunning():
+            self.conversation_recording_worker.stop()
+            self.conversation_recording_worker.wait(5000)
         if self.recording_thread is not None and self.recording_thread.isRunning():
             self.recording_thread.wait(5000)
         if self.worker_thread is not None and self.worker_thread.isRunning():

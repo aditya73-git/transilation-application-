@@ -129,11 +129,15 @@ audio:
   channels: 1
   chunk_size: 1024
   max_duration: 60
-  silence_threshold: 0.01
+  silence_threshold: 0.1
   silence_duration: 0.5
 esp:
-  enabled: false
-  host: 10.42.0.27
+  enabled: true
+  transport: wifi
+  ble_device_name: ReSpeaker-BLE-Audio
+  ble_device_address: ''
+  ble_scan_timeout: 8.0
+  host: 192.168.0.103
   mic_port: 12346
   playback_port: 12345
   mic_sample_width: 4
@@ -154,8 +158,10 @@ ui:
   show_processing_times: true
   show_logs: true
   auto_play_output: true
+  audio_log_enabled: true
   stt_only_mode: false
   live_streaming: false
+  conversation_mode: false
   stt_benchmark_cpu_gpu: false
   live_partial_interval: 1.0
   live_partial_step: 2.0

@@ -2,7 +2,6 @@
 import argparse
 import audioop
 import socket
-import struct
 import sys
 import time
 import wave
@@ -37,11 +36,8 @@ def mono16_chunk(wav_file, state):
     return raw, state
 
 
-def mono16_to_stereo32le(raw):
-    out = bytearray()
-    for (sample,) in struct.iter_unpack("<h", raw):
-        out.extend(struct.pack("<ii", sample, sample))
-    return bytes(out)
+def mono16_to_stereo16le(raw):
+    return audioop.tostereo(raw, 2, 1.0, 1.0)
 
 
 def main():
@@ -64,7 +60,7 @@ def main():
                 raw, state = mono16_chunk(wav_file, state)
                 if not raw:
                     break
-                payload = mono16_to_stereo32le(raw)
+                payload = mono16_to_stereo16le(raw)
                 sock.sendall(payload)
                 chunk_samples = len(raw) // 2
                 time.sleep(chunk_samples / TARGET_RATE)

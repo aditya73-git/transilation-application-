@@ -1,5 +1,6 @@
 """Audio input/output handling with graceful fallback for missing PortAudio"""
 import os
+import queue
 import shutil
 import signal
 import socket
@@ -41,18 +42,18 @@ class AudioHandler:
     def __init__(self, sample_rate=16000, esp_config=None):
         self.sample_rate = sample_rate
         esp_config = esp_config or {}
-        self.esp_enabled = bool(esp_config.get("enabled")) and bool(
-            (esp_config.get("host") or "").strip()
-        )
+        self.esp_requested_enabled = bool(esp_config.get("enabled"))
+        self.esp_transport = str(esp_config.get("transport", "wifi")).strip().lower() or "wifi"
         self.esp_host = (esp_config.get("host") or "").strip()
         self.esp_mic_port = int(esp_config.get("mic_port", 12346))
         self.esp_play_port = int(esp_config.get("playback_port", 12345))
         self.esp_mic_sample_width = int(esp_config.get("mic_sample_width", 4))
-        if self.esp_mic_sample_width not in (2, 4):
-            logger.warning("Unsupported ESP mic sample width %s; defaulting to 4", self.esp_mic_sample_width)
-            self.esp_mic_sample_width = 4
-        if esp_config.get("enabled") and not self.esp_host:
-            logger.warning("ESP enabled but host empty; ESP audio disabled")
+        self.esp_ble_device_name = (esp_config.get("ble_device_name") or "").strip()
+        self.esp_ble_device_address = (esp_config.get("ble_device_address") or "").strip()
+        self.esp_ble_scan_timeout = float(esp_config.get("ble_scan_timeout", 8.0))
+        self.esp_enabled = False
+        self._esp_stream_stop_event = None
+        self._refresh_esp_enabled()
 
         self.audio_data = None
         self.is_recording = False
@@ -80,6 +81,52 @@ class AudioHandler:
         else:
             logger.warning("Using mock audio handler - audio I/O will be simulated")
             logger.info("Operating in MOCK MODE (no real audio I/O)")
+
+    def _refresh_esp_enabled(self):
+        """Recompute whether the external ESP bridge is usable."""
+        if self.esp_transport not in {"wifi", "ble"}:
+            logger.warning("Unsupported ESP transport %s; defaulting to wifi", self.esp_transport)
+            self.esp_transport = "wifi"
+
+        if self.esp_mic_sample_width not in (2, 4):
+            logger.warning("Unsupported ESP mic sample width %s; defaulting to 4", self.esp_mic_sample_width)
+            self.esp_mic_sample_width = 4
+
+        if self.esp_transport == "ble":
+            has_target = bool(self.esp_ble_device_name or self.esp_ble_device_address)
+            if self.esp_requested_enabled and not has_target:
+                logger.warning("ESP BLE enabled but device name/address is empty; ESP audio disabled")
+        else:
+            has_target = bool(self.esp_host)
+            if self.esp_requested_enabled and not has_target:
+                logger.warning("ESP WiFi enabled but host empty; ESP audio disabled")
+
+        self.esp_enabled = bool(self.esp_requested_enabled and has_target)
+
+    def update_esp_config(self, esp_config: dict):
+        """Apply ESP transport settings at runtime."""
+        self.esp_requested_enabled = bool(esp_config.get("enabled"))
+        self.esp_transport = str(esp_config.get("transport", self.esp_transport)).strip().lower() or "wifi"
+        self.esp_host = str(esp_config.get("host", self.esp_host)).strip()
+        self.esp_mic_port = int(esp_config.get("mic_port", self.esp_mic_port))
+        self.esp_play_port = int(esp_config.get("playback_port", self.esp_play_port))
+        self.esp_mic_sample_width = int(esp_config.get("mic_sample_width", self.esp_mic_sample_width))
+        self.esp_ble_device_name = str(
+            esp_config.get("ble_device_name", self.esp_ble_device_name)
+        ).strip()
+        self.esp_ble_device_address = str(
+            esp_config.get("ble_device_address", self.esp_ble_device_address)
+        ).strip()
+        self.esp_ble_scan_timeout = float(
+            esp_config.get("ble_scan_timeout", self.esp_ble_scan_timeout)
+        )
+        self._refresh_esp_enabled()
+
+    def _esp_target_label(self) -> str:
+        """Human-readable label for the configured ESP endpoint."""
+        if self.esp_transport == "ble":
+            return self.esp_ble_device_address or self.esp_ble_device_name or "<unknown BLE device>"
+        return f"{self.esp_host}:{self.esp_mic_port}/{self.esp_play_port}"
 
     def list_devices(self):
         """List available audio devices"""
@@ -141,7 +188,39 @@ class AudioHandler:
         return self._pcm16_bytes_to_float32(buffer_copy)
 
     def _start_esp_mic_stream(self):
-        """TCP mic stream from ESP (16/32-bit stereo LE @ sample_rate) -> float32 mono buffer."""
+        """Start ESP mic streaming and convert it to the app's mono float32 format."""
+        if self.esp_transport == "ble":
+            from src.utils.esp_audio_transport import (
+                ble_pcm16_bytes_to_mono_float32,
+                stream_ble_mic_audio,
+            )
+
+            logger.info("ESP mic stream: ble://%s", self._esp_target_label())
+            stop_event = threading.Event()
+            self._esp_stream_stop_event = stop_event
+
+            def on_chunk(data: bytes):
+                mono = ble_pcm16_bytes_to_mono_float32(data, target_rate=self.sample_rate)
+                if mono.size == 0:
+                    return
+                with self.stream_buffer_lock:
+                    self.stream_buffer.extend(mono.astype(np.float32).tobytes())
+
+            def reader():
+                ok = stream_ble_mic_audio(
+                    device_name=self.esp_ble_device_name,
+                    device_address=self.esp_ble_device_address,
+                    stop_event=stop_event,
+                    on_chunk=on_chunk,
+                    scan_timeout=self.esp_ble_scan_timeout,
+                )
+                if not ok and self.is_recording:
+                    logger.error("ESP BLE mic streaming stopped unexpectedly")
+
+            self.stream_reader_thread = threading.Thread(target=reader, daemon=True)
+            self.stream_reader_thread.start()
+            return
+
         from src.utils.esp_audio_transport import pcm_stereo_bytes_to_mono_float32
 
         logger.info(
@@ -185,6 +264,7 @@ class AudioHandler:
                 except OSError:
                     pass
 
+        self._esp_stream_stop_event = None
         self.stream_reader_thread = threading.Thread(target=reader, daemon=True)
         self.stream_reader_thread.start()
 
@@ -201,6 +281,7 @@ class AudioHandler:
 
         if self.stream_reader_thread and self.stream_reader_thread.is_alive():
             self.stream_reader_thread.join(timeout=5)
+        self._esp_stream_stop_event = None
 
         if self.recording_process and self.recording_process.returncode not in (0, -2, -15):
             logger.warning(
@@ -288,6 +369,9 @@ class AudioHandler:
 
     def _record_audio_esp(self, duration=None, threshold=0.02, silence_duration=0.5):
         """Push-to-talk recording from ESP TCP mic (16/32-bit stereo)."""
+        if self.esp_transport == "ble":
+            return self._record_audio_esp_ble(duration, threshold, silence_duration)
+
         from src.utils.esp_audio_transport import pcm_stereo_bytes_to_mono_float32
 
         if not self.esp_host:
@@ -354,6 +438,83 @@ class AudioHandler:
         audio_data = np.concatenate(chunks)
         self.audio_data = audio_data
         logger.info("ESP recording complete. Duration: %.2fs", len(audio_data) / self.sample_rate)
+        return audio_data
+
+    def _record_audio_esp_ble(self, duration=None, threshold=0.02, silence_duration=0.5):
+        """Push-to-talk recording from ESP BLE mic notifications."""
+        from src.utils.esp_audio_transport import ble_pcm16_bytes_to_mono_float32, stream_ble_mic_audio
+
+        if not (self.esp_ble_device_name or self.esp_ble_device_address):
+            logger.error("ESP BLE device name/address not set")
+            return np.array([], dtype=np.float32)
+
+        logger.info("Recording from ESP BLE mic (%s)...", self._esp_target_label())
+        stop_event = threading.Event()
+        mic_queue: queue.Queue[bytes] = queue.Queue(maxsize=256)
+        chunks = []
+        silence_samples = int(self.sample_rate * silence_duration)
+        silence_count = 0
+        started_at = time.time()
+
+        def on_chunk(data: bytes):
+            try:
+                mic_queue.put_nowait(bytes(data))
+            except queue.Full:
+                logger.warning("ESP BLE mic queue full; dropping audio chunk")
+
+        def reader():
+            ok = stream_ble_mic_audio(
+                device_name=self.esp_ble_device_name,
+                device_address=self.esp_ble_device_address,
+                stop_event=stop_event,
+                on_chunk=on_chunk,
+                scan_timeout=self.esp_ble_scan_timeout,
+            )
+            if not ok and self.is_recording:
+                logger.error("ESP BLE mic capture failed")
+
+        self._esp_stream_stop_event = stop_event
+        worker = threading.Thread(target=reader, daemon=True)
+        worker.start()
+
+        try:
+            while self.is_recording:
+                try:
+                    raw_chunk = mic_queue.get(timeout=0.35)
+                except queue.Empty:
+                    if not worker.is_alive():
+                        break
+                    continue
+
+                mono = ble_pcm16_bytes_to_mono_float32(raw_chunk, target_rate=self.sample_rate)
+                if mono.size == 0:
+                    continue
+                chunks.append(mono)
+
+                amplitude = float(np.max(np.abs(mono))) if mono.size else 0.0
+                if amplitude < threshold:
+                    silence_count += mono.size
+                    if silence_count > silence_samples and len(chunks) > 5:
+                        logger.info("Silence detected (ESP BLE), stopping recording")
+                        break
+                else:
+                    silence_count = 0
+
+                if duration and (time.time() - started_at) >= duration:
+                    logger.info("Max duration reached (ESP BLE)")
+                    break
+        finally:
+            stop_event.set()
+            worker.join(timeout=5)
+            self._esp_stream_stop_event = None
+
+        if not chunks:
+            logger.warning("No ESP BLE mic data captured")
+            return np.array([], dtype=np.float32)
+
+        audio_data = np.concatenate(chunks)
+        self.audio_data = audio_data
+        logger.info("ESP BLE recording complete. Duration: %.2fs", len(audio_data) / self.sample_rate)
         return audio_data
 
     def _start_pw_record_stream(self):
@@ -684,14 +845,26 @@ class AudioHandler:
     def stop_recording(self):
         """Stop recording"""
         self.is_recording = False
+        if self._esp_stream_stop_event is not None:
+            self._esp_stream_stop_event.set()
         if self.recording_process and self.recording_process.poll() is None:
             self.recording_process.send_signal(signal.SIGINT)
 
     def play_wav_file_to_esp(self, wav_path) -> bool:
-        """Send a WAV file to the ESP playback TCP port (16 kHz stereo int16)."""
+        """Send a WAV file to the configured ESP playback transport."""
         if not self.esp_enabled:
             logger.warning("play_wav_file_to_esp called but ESP disabled")
             return False
+        if self.esp_transport == "ble":
+            from src.utils.esp_audio_transport import stream_wav_to_esp_ble
+
+            return stream_wav_to_esp_ble(
+                self.esp_ble_device_name,
+                self.esp_ble_device_address,
+                wav_path,
+                scan_timeout=self.esp_ble_scan_timeout,
+            )
+
         from src.utils.esp_audio_transport import stream_wav_to_esp
 
         return stream_wav_to_esp(self.esp_host, self.esp_play_port, wav_path)
